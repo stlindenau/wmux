@@ -344,7 +344,7 @@ resources/wmux-orchestrator/
 
 **Key design:** Skills handle intelligence (prompts), hooks handle reactivity (events), scripts handle wmux operations (CLI). State shared via JSON file in TMPDIR. No daemon.
 
-**Devcontainer transport (issue #19):** `resources/wmux-orchestrator/server/` is a FastAPI HTTP front end over the `wmux` CLI (`wmux serve-api`, opt-in via `WMUX_ENABLE_API=1`), letting Claude Code sessions inside a Linux devcontainer — which can't open a Windows named pipe — drive wmux over HTTP instead. `scripts/wmux-resolve.sh`, `src/cli/wmux-hook.ts`, and `src/shell-integration/wmux-bash-integration.sh` all switch to this transport automatically when `WMUX_API_URL`/`WMUX_PIPE_TOKEN` are set. See `resources/wmux-orchestrator/docs/DEVCONTAINER.md`.
+**Devcontainer transport (issue #19):** Claude Code sessions inside a Linux devcontainer can't open a Windows named pipe, so they drive wmux through its existing TCP remote-management support instead (`wmux bridge` + `--remote`/`WMUX_REMOTE`, issue #78) — no new server or protocol. `wmux-resolve.sh`'s `wmux()` shim already works over this transport unmodified; `src/cli/wmux-hook.ts` connects via TCP directly when `WMUX_REMOTE` is set (mirroring `connectTransport()` in `wmux.ts`); `src/shell-integration/wmux-bash-integration.sh` calls the new `wmux raw-v1 <line>` CLI command instead of writing to the native WSL temp-file path. See `resources/wmux-orchestrator/docs/DEVCONTAINER.md`.
 
 ---
 
@@ -395,9 +395,8 @@ wmux log <level> <message> | sidebar-state
 # Hooks
 wmux hook --event <type> --tool <name> [--agent <id>]
 
-# Devcontainer bridge (issue #19)
-wmux raw-v1 <command> [surfaceId] [args...]   # send a raw V1 pipe command
-wmux serve-api [--port P] [--host H]          # start the FastAPI command server (requires WMUX_ENABLE_API=1)
+# Devcontainer support (issue #19)
+wmux raw-v1 <command> [surfaceId] [args...]   # send a raw V1 pipe command (works over --remote too)
 ```
 
 ---

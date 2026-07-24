@@ -18,15 +18,14 @@ Object.defineProperty(exports, "__esModule", { value: true });
  *   - Notification           → extracts the `message` (what the agent is waiting for)
  * WMUX_SURFACE_ID (set by wmux in each pane's shell) ties the event to its pane.
  *
- * Transport (issue #19): connects to the named pipe by default. When
- * WMUX_API_URL is set (e.g. running inside a devcontainer that cannot reach
- * a Windows named pipe directly), POSTs the same event to the FastAPI
- * command server's /v1/hook endpoint instead, authenticated with the same
- * WMUX_PIPE_TOKEN this script already reads.
+ * Transport: connects to the named pipe (WMUX_PIPE) by default. When
+ * WMUX_REMOTE is set (e.g. running inside a devcontainer that cannot open a
+ * Windows named pipe directly, driving a `wmux bridge` on the host instead —
+ * issue #78), connects over TCP to that host:port instead, mirroring
+ * connectTransport() in wmux.ts. Auth token is the same WMUX_PIPE_TOKEN /
+ * WMUX_REMOTE_TOKEN this script already reads either way.
  */
 const net_1 = __importDefault(require("net"));
-const http_1 = __importDefault(require("http"));
-const https_1 = __importDefault(require("https"));
 const argv = process.argv.slice(2);
 let tool = '';
 let event = '';
@@ -36,10 +35,28 @@ if (argv[0] === '--event') {
 else {
     tool = argv[0] || 'unknown';
 }
+const DEFAULT_BRIDGE_PORT = 9787;
 const pipePath = process.env.WMUX_PIPE || '\\\\.\\pipe\\wmux';
-const token = process.env.WMUX_PIPE_TOKEN || '';
+const token = process.env.WMUX_REMOTE_TOKEN || process.env.WMUX_PIPE_TOKEN || '';
 const surfaceId = process.env.WMUX_SURFACE_ID || '';
-const apiUrl = process.env.WMUX_API_URL || '';
+function remoteTarget() {
+    const spec = process.env.WMUX_REMOTE?.trim();
+    if (!spec)
+        return null;
+    const idx = spec.lastIndexOf(':');
+    if (idx === -1)
+        return { host: spec, port: DEFAULT_BRIDGE_PORT };
+    const port = parseInt(spec.slice(idx + 1), 10);
+    return Number.isFinite(port) && port > 0 && port <= 65535
+        ? { host: spec.slice(0, idx) || '127.0.0.1', port }
+        : { host: spec, port: DEFAULT_BRIDGE_PORT };
+}
+function connectTransport(onConnect) {
+    const remote = remoteTarget();
+    return remote
+        ? net_1.default.connect({ host: remote.host, port: remote.port }, onConnect)
+        : net_1.default.connect({ path: pipePath }, onConnect);
+}
 let stdinData = '';
 let sent = false;
 const MAX_STDIN = 64 * 1024; // 64KB cap
@@ -75,45 +92,14 @@ function sendHook() {
         params.message = message;
     if (surfaceId)
         params.surfaceId = surfaceId;
-    if (apiUrl) {
-        sendHookHttp(params);
-        return;
-    }
-    const client = net_1.default.connect({ path: pipePath }, () => {
+    const client = connectTransport(() => {
         const msg = JSON.stringify({ method: 'hook.event', params, id: 1, token });
         client.write(msg + '\n', () => client.end());
     });
     client.on('error', () => {
-        // wmux not running — silently ignore.
+        // wmux (or the bridge) not reachable — silently ignore.
         process.exit(0);
     });
-}
-// Devcontainer transport (issue #19): POST the same event/tool/file/message/
-// surfaceId payload to the FastAPI command server's /v1/hook endpoint.
-function sendHookHttp(params) {
-    let url;
-    try {
-        url = new URL('/v1/hook', apiUrl);
-    }
-    catch {
-        process.exit(0);
-        return;
-    }
-    const body = JSON.stringify(params);
-    const transport = url.protocol === 'https:' ? https_1.default : http_1.default;
-    const req = transport.request(url, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'Content-Length': Buffer.byteLength(body),
-            ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        timeout: 3000,
-    }, (res) => { res.resume(); process.exit(0); });
-    req.on('error', () => process.exit(0));
-    req.on('timeout', () => { req.destroy(); process.exit(0); });
-    req.write(body);
-    req.end();
 }
 // Read stdin (Claude Code pipes the hook payload as JSON).
 process.stdin.setEncoding('utf8');

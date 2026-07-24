@@ -148,10 +148,9 @@ wmux-orchestrator/
 ## Running inside a devcontainer
 
 Claude Code sessions inside a Linux devcontainer can't reach wmux's Windows
-named pipe directly. Set `WMUX_API_URL` (and `WMUX_PIPE_TOKEN`) to route
-through the bundled FastAPI command server instead -- see
-[`docs/DEVCONTAINER.md`](docs/DEVCONTAINER.md) for setup and the full
-endpoint reference.
+named pipe directly. Run `wmux bridge` on the host and set `WMUX_REMOTE`
+(and `WMUX_REMOTE_TOKEN`) in the container to route through it instead --
+see [`docs/DEVCONTAINER.md`](docs/DEVCONTAINER.md) for setup.
 
 ## Links
 

@@ -8,7 +8,6 @@ const net_1 = __importDefault(require("net"));
 const fs_1 = __importDefault(require("fs"));
 const os_1 = __importDefault(require("os"));
 const path_1 = __importDefault(require("path"));
-const child_process_1 = require("child_process");
 // Respect WMUX_PIPE when set (e.g. by a parent wmux running with WMUX_INSTANCE),
 // so the CLI talks to the same instance that spawned the shell.
 const PIPE_PATH = process.env.WMUX_PIPE || '\\\\.\\pipe\\wmux';
@@ -474,11 +473,15 @@ async function cmdAgentActivity(args) {
         params.done = false;
     await sendV2('agent.activity', params);
 }
-// Generic V1 passthrough (devcontainer FastAPI bridge, issue #19): lets a
-// caller send any raw V1 command line (report_pwd, report_git_branch,
+// Generic V1 passthrough (issue #19: devcontainer support): lets a caller
+// send any raw V1 command line (report_pwd, report_git_branch,
 // report_shell_state, ...) without the CLI needing a dedicated wrapper for
-// each one. wmux-bash-integration.sh's `_wmux_report` sends the same lines
-// directly today when running natively; the HTTP bridge relays through here.
+// each one. wmux-bash-integration.sh's `_wmux_report` sends these lines
+// directly to the local pipe/temp file when running natively; inside a
+// devcontainer (where neither is reachable) it calls `wmux raw-v1` instead,
+// which — like every other command — transparently goes over TCP via
+// --remote/WMUX_REMOTE when a local pipe isn't available (see `wmux bridge`,
+// issue #78).
 async function cmdRawV1(args) {
     const line = args.slice(1).join(' ');
     if (!line) {
@@ -486,30 +489,6 @@ async function cmdRawV1(args) {
         process.exit(1);
     }
     console.log(await sendV1(line));
-}
-// Starts the FastAPI command server (resources/wmux-orchestrator/server/app.py)
-// so a devcontainer (which cannot reach a Windows named pipe directly) can
-// drive wmux over HTTP instead (issue #19). Opt-in: refuses to start unless
-// WMUX_ENABLE_API=1 is set, mirroring the "used if certain environment
-// variables are set" requirement. The server itself re-verifies every
-// request against the same pipe token this CLI already reads.
-async function cmdServeApi(args) {
-    if (process.env.WMUX_ENABLE_API !== '1') {
-        console.error('wmux serve-api requires WMUX_ENABLE_API=1 (opt-in) — see resources/wmux-orchestrator/server/README.md');
-        process.exit(1);
-    }
-    const port = getFlag(args, '--port') || '8787';
-    const host = getFlag(args, '--host') || '127.0.0.1';
-    const serverDir = process.resourcesPath
-        ? path_1.default.join(process.resourcesPath, 'wmux-orchestrator', 'server')
-        : path_1.default.resolve(__dirname, '../../resources/wmux-orchestrator/server');
-    const child = (0, child_process_1.spawn)('python3', ['-m', 'uvicorn', 'app:app', '--host', host, '--port', port], {
-        cwd: serverDir,
-        stdio: 'inherit',
-        env: { ...process.env, WMUX_CLI: process.env.WMUX_CLI || __filename },
-    });
-    child.on('error', (err) => { console.error(`Failed to start wmux serve-api: ${err.message}`); process.exit(1); });
-    child.on('exit', (code) => process.exit(code ?? 0));
 }
 // Command dispatch table. Each handler receives the raw argv (args[0] is the
 // command name). Replaces a single giant switch so each command stays small and
@@ -637,9 +616,8 @@ const COMMANDS = {
     },
     hook: cmdHook,
     'agent-activity': cmdAgentActivity,
-    // Devcontainer HTTP bridge (issue #19)
+    // Devcontainer support (issue #19)
     'raw-v1': cmdRawV1,
-    'serve-api': cmdServeApi,
 };
 async function main() {
     let args = process.argv.slice(2);
@@ -704,10 +682,10 @@ Sidebar:    set-status, set-progress, log, sidebar-state
 Hook:       hook --event <type> --tool <name> [--agent <id>]
 Config:     config show|reload|path   (edits ~/.wmux/config.toml — see docs)
             reload-config             (shorthand for 'config reload')
-Devcontainer bridge (issue #19):
-            raw-v1 <command> [surfaceId] [args...]   (send a raw V1 pipe command)
-            serve-api [--port P] [--host H]   (start the FastAPI command server;
-            requires WMUX_ENABLE_API=1 — see resources/wmux-orchestrator/server/)
+Devcontainer support (issue #19):
+            raw-v1 <command> [surfaceId] [args...]   (send a raw V1 pipe command;
+            works over --remote/WMUX_REMOTE too, e.g. from inside a container
+            driving a wmux bridge on the host)
 `);
 }
 main();

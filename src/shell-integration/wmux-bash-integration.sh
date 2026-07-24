@@ -10,34 +10,23 @@ export -f wmux
 
 _wmux_report() {
     local msg="$1"
-    # Devcontainer transport (issue #19): when WMUX_API_URL is set (this
-    # shell can't reach a Windows named pipe or the host's Temp dir directly,
-    # e.g. running inside a Linux container), relay the same V1 command line
-    # to the FastAPI command server's generic passthrough instead of writing
-    # to the native message file. Fire-and-forget: short timeout, discard
-    # output, never block or fail the prompt on a slow/unreachable server.
-    if [ -n "${WMUX_API_URL}" ]; then
-        curl -fsS -m 2 -X POST "${WMUX_API_URL%/}/v1/raw" \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer ${WMUX_PIPE_TOKEN}" \
-            -d "$(printf '{"line":%s}' "$(_wmux_json_string "$msg")")" \
-            >/dev/null 2>&1 &
-        disown 2>/dev/null
+    # Devcontainer transport (issue #19): when WMUX_REMOTE is set (this shell
+    # can't reach a Windows named pipe or the host's Temp dir directly, e.g.
+    # running inside a Linux container driving a `wmux bridge` on the host —
+    # issue #78), relay the same V1 command line via `wmux raw-v1` instead of
+    # writing to the native message file. The `wmux` shim already resolves to
+    # `node "$WMUX_CLI"`, which transparently uses the TCP remote transport
+    # once WMUX_REMOTE/WMUX_REMOTE_TOKEN are set — no protocol duplication
+    # here. Fire-and-forget: backgrounded, output discarded, never blocks or
+    # fails the prompt on a slow/unreachable bridge.
+    if [ -n "${WMUX_REMOTE}" ] && command -v wmux &>/dev/null; then
+        ( wmux raw-v1 "$msg" >/dev/null 2>&1 & )
         return
     fi
     # Native: write to temp file for the main process to pick up.
     local tmpdir="/mnt/c/Users/${USER}/AppData/Local/Temp/wmux"
     mkdir -p "$tmpdir" 2>/dev/null
     echo "$msg" >> "$tmpdir/messages"
-}
-
-# Minimal JSON string escaper (backslash, double-quote, control chars) — avoids
-# a hard dependency on jq/python just to build a one-field JSON body.
-_wmux_json_string() {
-    local s="$1"
-    s="${s//\\/\\\\}"
-    s="${s//\"/\\\"}"
-    printf '"%s"' "$s"
 }
 
 _wmux_report_cwd() {
