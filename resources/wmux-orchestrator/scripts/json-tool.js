@@ -364,6 +364,27 @@ function cmdDashboard(file) {
 }
 
 /**
+ * Build a compact JSON object from field=value pairs, smart-parsing each
+ * value the same way `set`/`update-agent` do (numbers/booleans/null parse as
+ * JSON literals, everything else stays a string). Empty values are omitted
+ * so optional CLI flags translate cleanly to optional JSON fields.
+ * Used by wmux-resolve.sh's HTTP transport shim to build FastAPI request
+ * bodies without a hard dependency on jq inside the devcontainer.
+ */
+function cmdBuildJson(assignments) {
+  const obj = {};
+  for (const assignment of assignments) {
+    const eqIdx = assignment.indexOf('=');
+    if (eqIdx === -1) continue;
+    const field = assignment.slice(0, eqIdx);
+    const rawVal = assignment.slice(eqIdx + 1);
+    if (rawVal === '') continue;
+    obj[field] = parseValue(rawVal);
+  }
+  process.stdout.write(JSON.stringify(obj) + '\n');
+}
+
+/**
  * Parse a JSON string from stdin or argument and extract a path.
  * Used to replace: echo "$json" | jq -r '.field'
  */
@@ -392,7 +413,7 @@ const cmd = args[0];
 
 if (!cmd) {
   process.stderr.write('Usage: node json-tool.js <command> [args...]\n');
-  process.stderr.write('Commands: get, set, inc, query, update-agent, dashboard, parse-json\n');
+  process.stderr.write('Commands: get, set, inc, query, update-agent, dashboard, parse-json, build-json\n');
   process.exit(1);
 }
 
@@ -430,6 +451,10 @@ switch (cmd) {
   case 'parse-json':
     if (args.length < 3) { process.stderr.write('Usage: node json-tool.js parse-json <jsonString> <path>\n'); process.exit(1); }
     cmdParseJson(args[1], args[2]);
+    break;
+
+  case 'build-json':
+    cmdBuildJson(args.slice(1));
     break;
 
   default:

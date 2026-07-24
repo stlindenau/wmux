@@ -1,0 +1,19 @@
+{
+  "name": "wmux",
+  "owner": {
+    "name": "amirlehmam",
+    "email": "amir@wmux.org"
+  },
+  "metadata": {
+    "description": "Marketplace for wmux's bundled Claude Code plugins."
+  },
+  "plugins": [
+    {
+      "name": "wmux-orchestrator",
+      "source": "./resources/wmux-orchestrator",
+      "description": "Multi-agent task orchestration with visual terminal panes. Decomposes complex dev tasks into parallel Claude Code instances coordinated through dependency-aware waves.",
+      "version": "0.1.2",
+      "license": "MIT"
+    }
+  ]
+}

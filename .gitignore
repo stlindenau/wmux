@@ -11,3 +11,9 @@ release/
 
 # Local Claude Code settings
 .claude/settings.local.json
+
+# Python (wmux command server)
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
