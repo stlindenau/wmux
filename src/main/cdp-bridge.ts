@@ -2,13 +2,39 @@ import { webContents } from 'electron';
 import { CDPSnapshot } from '../shared/types';
 
 interface RefEntry {
-  nodeId: number;
-  backendNodeId: number;
+  /** `AXNode.nodeId` — an accessibility-tree id (a *string*), not a DOM node id. */
+  axNodeId: string;
+  /** `AXNode.backendDOMNodeId` — the integer DOM handle every DOM.* call needs.
+   *  Null for accessibility-only nodes that back no DOM element. */
+  backendDOMNodeId: number | null;
+  /** Role, kept only so ref errors can say what the ref pointed at. */
+  role: string;
 }
 
 const SKIP_ROLES = new Set([
   'generic', 'none', 'presentation', 'InlineTextBox', 'LineBreak',
 ]);
+
+/**
+ * Pull the DOM handle off an AX node.
+ *
+ * `Accessibility.getFullAXTree` returns `AXNode`s whose `nodeId` is an
+ * `AXNodeId` — a *string* keyed to the accessibility tree — and whose DOM
+ * handle is a separate integer under `backendDOMNodeId`. We used to read
+ * `node.backendNodeId` (a field AXNode does not have) and fall back to
+ * `node.nodeId`, so every ref carried an AX string where `DOM.getBoxModel` /
+ * `DOM.resolveNode` require an integer. CDP rejected it as a bare
+ * `Invalid parameters`, breaking click / type / fill / get-text (issue #123).
+ * The bug predates #121 — it was simply unreachable while every ref lookup
+ * failed with `ref_not_found` first.
+ *
+ * `backendNodeId` stays accepted as an alias so protocol dumps and callers
+ * that hand-build node lists keep working.
+ */
+function backendDomIdOf(node: any): number | null {
+  const raw = node?.backendDOMNodeId ?? node?.backendNodeId ?? node?.nodeId;
+  return typeof raw === 'number' && Number.isInteger(raw) && raw > 0 ? raw : null;
+}
 
 export function buildAccessibilityTree(
   nodes: any[],
@@ -34,7 +60,11 @@ export function buildAccessibilityTree(
 
     refCounter++;
     const ref = `@e${refCounter}`;
-    refMap.set(ref, { nodeId: node.nodeId, backendNodeId: node.backendNodeId || node.nodeId });
+    refMap.set(ref, {
+      axNodeId: String(node.nodeId),
+      backendDOMNodeId: backendDomIdOf(node),
+      role,
+    });
 
     const indent = '  '.repeat(depth);
     let line = `${indent}${ref}: ${role}`;
@@ -50,8 +80,29 @@ export function buildAccessibilityTree(
   return { tree: lines.join('\n'), refCount: refCounter, refMap };
 }
 
+/**
+ * Canonical key form for the ref map: `@e<n>`, matching what the snapshot tree
+ * prints. Everything else a caller might plausibly send is folded onto it.
+ *
+ * Refs used to be looked up verbatim, so only the exact `@e12` matched — while
+ * the CLI, the orchestrator reference and every doc example pass the bare `e12`.
+ * The result was that *every* ref-consuming command (`click`, `type`, `fill`,
+ * `get_text`, `wait`) failed with `ref_not_found` immediately after a snapshot
+ * that had just minted that very ref (issue #121). And `@e12` isn't a usable
+ * workaround from PowerShell, where a leading `@` is the splatting operator and
+ * the argument is mangled before wmux sees it — which is exactly why the docs
+ * told callers to drop it. Both spellings (and a bare number) now resolve.
+ */
+export function normalizeRef(ref: unknown): string | null {
+  if (typeof ref === 'number' && Number.isInteger(ref) && ref > 0) return `@e${ref}`;
+  if (typeof ref !== 'string') return null;
+  const match = /^\s*@?e?(\d+)\s*$/i.exec(ref);
+  return match ? `@e${Number(match[1])}` : null;
+}
+
 export function resolveRef(refMap: Map<string, RefEntry>, ref: string): RefEntry | null {
-  return refMap.get(ref) ?? null;
+  const key = normalizeRef(ref);
+  return key ? refMap.get(key) ?? null : null;
 }
 
 // One attached browser webContents. Each agent/caller gets its own target so
@@ -180,14 +231,82 @@ export class CDPBridge {
     return { tree, refCount };
   }
 
+  /**
+   * Resolve a ref or fail with a message that says what went wrong. The bare
+   * `ref_not_found` sent people hunting connection lifetimes and timing (issue
+   * #121) when the real answers are "you never snapshotted this browser" or
+   * "that ref is past the end of the tree".
+   */
+  private requireRef(target: CDPTarget, ref: string): RefEntry {
+    const entry = resolveRef(target.refMap, ref);
+    if (entry) return entry;
+    if (normalizeRef(ref) === null) {
+      throw new Error(`ref_not_found: "${ref}" is not a ref — expected e12 or @e12`);
+    }
+    if (target.refMap.size === 0) {
+      throw new Error('ref_not_found: no snapshot yet for this browser — run browser.snapshot first');
+    }
+    throw new Error(`ref_not_found: ${ref} — the last snapshot of this browser has @e1..@e${target.refMap.size}`);
+  }
+
+  /**
+   * The DOM handle behind a ref. An accessibility-only node (no backing
+   * element) is a real, if rare, outcome — say so instead of handing CDP an
+   * id it will reject as `Invalid parameters` (issue #123).
+   */
+  private requireDomNode(target: CDPTarget, ref: string): number {
+    const entry = this.requireRef(target, ref);
+    if (entry.backendDOMNodeId === null) {
+      throw new Error(
+        `no_dom_node: ${normalizeRef(ref)} (${entry.role || 'unknown role'}) is an accessibility-only node with no DOM element — pick a ref that maps to one`,
+      );
+    }
+    return entry.backendDOMNodeId;
+  }
+
+  private async resolveObjectId(target: CDPTarget, backendNodeId: number): Promise<string> {
+    const { object } = await this.sendCommand(target, 'DOM.resolveNode', { backendNodeId });
+    if (!object?.objectId) throw new Error('node_unresolvable: the element is no longer in the page');
+    return object.objectId;
+  }
+
+  /**
+   * Viewport centre of an element. `DOM.getBoxModel` is exact but throws for
+   * anything with no layout box (display:none, an off-screen detached node, a
+   * text node in some engines), so fall back to a scroll-into-view +
+   * `getBoundingClientRect()` in page context.
+   */
+  private async centerOf(target: CDPTarget, backendNodeId: number): Promise<{ x: number; y: number }> {
+    try {
+      const { model } = await this.sendCommand(target, 'DOM.getBoxModel', { backendNodeId });
+      const c = model?.content;
+      if (Array.isArray(c) && c.length >= 8) {
+        return { x: (c[0] + c[2] + c[4] + c[6]) / 4, y: (c[1] + c[3] + c[5] + c[7]) / 4 };
+      }
+    } catch {
+      // fall through to the layout-independent path
+    }
+    const objectId = await this.resolveObjectId(target, backendNodeId);
+    const { result } = await this.sendCommand(target, 'Runtime.callFunctionOn', {
+      objectId,
+      functionDeclaration: `function() {
+        const el = this.nodeType === 3 ? this.parentElement : this;
+        if (!el) return null;
+        el.scrollIntoView({ block: 'center', inline: 'center' });
+        const r = el.getBoundingClientRect();
+        if (!r.width && !r.height) return null;
+        return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+      }`,
+      returnByValue: true,
+    });
+    if (!result?.value) throw new Error('not_clickable: the element has no visible box on the page');
+    return result.value;
+  }
+
   async click(ref: string, wcId?: number): Promise<void> {
     const target = this.resolveTarget(wcId);
-    const entry = resolveRef(target.refMap, ref);
-    if (!entry) throw new Error('ref_not_found');
-    const { model } = await this.sendCommand(target, 'DOM.getBoxModel', { backendNodeId: entry.backendNodeId });
-    const content = model.content;
-    const x = (content[0] + content[2] + content[4] + content[6]) / 4;
-    const y = (content[1] + content[3] + content[5] + content[7]) / 4;
+    const backendNodeId = this.requireDomNode(target, ref);
+    const { x, y } = await this.centerOf(target, backendNodeId);
     await this.sendCommand(target, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
     await this.sendCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
   }
@@ -203,12 +322,15 @@ export class CDPBridge {
 
   async fill(ref: string, value: string, wcId?: number): Promise<void> {
     const target = this.resolveTarget(wcId);
-    const entry = resolveRef(target.refMap, ref);
-    if (!entry) throw new Error('ref_not_found');
-    const { object } = await this.sendCommand(target, 'DOM.resolveNode', { backendNodeId: entry.backendNodeId });
+    const backendNodeId = this.requireDomNode(target, ref);
+    const objectId = await this.resolveObjectId(target, backendNodeId);
     await this.sendCommand(target, 'Runtime.callFunctionOn', {
-      objectId: object.objectId,
-      functionDeclaration: `function(v) { this.value = v; this.dispatchEvent(new Event('input', {bubbles:true})); }`,
+      objectId,
+      functionDeclaration: `function(v) {
+        this.value = v;
+        this.dispatchEvent(new Event('input', { bubbles: true }));
+        this.dispatchEvent(new Event('change', { bubbles: true }));
+      }`,
       arguments: [{ value }],
     });
   }
@@ -230,11 +352,10 @@ export class CDPBridge {
   async getText(ref?: string, wcId?: number): Promise<string> {
     const target = this.resolveTarget(wcId);
     if (ref) {
-      const entry = resolveRef(target.refMap, ref);
-      if (!entry) throw new Error('ref_not_found');
-      const { object } = await this.sendCommand(target, 'DOM.resolveNode', { backendNodeId: entry.backendNodeId });
+      const backendNodeId = this.requireDomNode(target, ref);
+      const objectId = await this.resolveObjectId(target, backendNodeId);
       const result = await this.sendCommand(target, 'Runtime.callFunctionOn', {
-        objectId: object.objectId, functionDeclaration: 'function() { return this.innerText || this.textContent || ""; }', returnByValue: true,
+        objectId, functionDeclaration: 'function() { return this.innerText || this.textContent || ""; }', returnByValue: true,
       });
       return result.result.value || '';
     }

@@ -3,11 +3,13 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { IPC_CHANNELS, SurfaceId, WindowId, WorkspaceId, AgentId } from '../shared/types';
-import { observePtyData } from './claude-observer';
+import { observePtyData, clearActivity } from './claude-observer';
+import { clearAgentState } from './agent-state';
 import { PtyManager } from './pty-manager';
 import { NotificationManager } from './notification-manager';
 import { detectShells } from './shell-detector';
 import { listSystemFonts } from './font-detector';
+import { isContextMenuInstalled, installContextMenu, uninstallContextMenu } from './shell-context-menu';
 import { getDefaultTheme, getThemeByName, loadBundledThemes } from './theme-loader';
 import { parseWindowsTerminalConfig, parseGhosttyConfig, loadProjectProfiles, importWindowsTerminalProfiles } from './config-loader';
 import { loadUserConfig, getConfigPath } from './user-config';
@@ -16,8 +18,17 @@ import { CDPBridge } from './cdp-bridge';
 import { CDPProxy } from './cdp-proxy';
 import { AgentManager } from './agent-manager';
 import { saveNamedSession, loadNamedSession, listNamedSessions, deleteNamedSession, loadSession } from './session-persistence';
+import { sessionWindows, toRestorePayload } from './session-windows';
 import { loadSettings, saveSetting } from './settings-store';
 import { getChangedFiles, getFileDiff } from './diff-provider';
+import {
+  readMarkdownFile,
+  isAllowedMarkdownPath,
+  statMarkdownFile,
+  writeMarkdownFile,
+  MD_DIALOG_EXTENSIONS,
+} from './markdown-file';
+import { grantMarkdownPath, isMarkdownPathGranted } from './markdown-grants';
 
 const ptyManager = new PtyManager();
 const notificationManager = new NotificationManager();
@@ -63,6 +74,12 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
         if (window && !window.isDestroyed()) {
           window.webContents.send(IPC_CHANNELS.PTY_EXIT, id, code);
         }
+        // The process that owned this surface is gone, so any state it declared
+        // is now a lie. Drop it rather than leave a `working`/`blocked` pane
+        // pointing at a dead PID (issue #128); the observer's scraped activity
+        // goes with it, since it describes the same dead process.
+        clearAgentState(id);
+        clearActivity(id);
         // Clean up listeners when PTY exits
         unsubData();
         unsubExit();
@@ -269,22 +286,22 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
   ipcMain.handle(IPC_CHANNELS.SESSION_LIST_NAMED, () => {
     return listNamedSessions();
   });
-  // Return the most recent auto-saved session in the flattened shape the
-  // renderer's restore code already understands. Used on app launch so the
-  // workspaces / splits / tabs persisted by the 30s rolling save are actually
-  // rehydrated (instead of the renderer falling back to a fresh "Session 1").
-  ipcMain.handle(IPC_CHANNELS.SESSION_LOAD_AUTO, () => {
-    const data = loadSession();
-    const win = data?.windows?.[0];
-    if (!win) return null;
-    const activeIndex = win.activeWorkspaceId
-      ? win.workspaces.findIndex(w => w.id === win.activeWorkspaceId)
-      : 0;
-    return {
-      workspaces: win.workspaces,
-      sidebarWidth: win.sidebarWidth,
-      activeIndex: activeIndex >= 0 ? activeIndex : 0,
-    };
+  // Return the auto-saved session in the flattened shape the renderer's restore
+  // code already understands. Used on app launch so the workspaces / splits /
+  // tabs persisted by the 30s rolling save are actually rehydrated (instead of
+  // the renderer falling back to a fresh "Session 1").
+  //
+  // Answered per window (issue #118): main primes each restored window's slot
+  // at creation, so a window gets back its own workspaces. Returning windows[0]
+  // to every caller — the old behaviour — meant a window opened during the run
+  // came up as a clone of the first window's tabs, and multi-window sessions
+  // could never restore more than one window's worth of state.
+  ipcMain.handle(IPC_CHANNELS.SESSION_LOAD_AUTO, (event) => {
+    const windowId = windowManager.idForWebContents(event.sender);
+    if (windowId) return toRestorePayload(sessionWindows.get(windowId));
+    // Unattributable sender: fall back to the file's first window rather than
+    // leaving a legitimately-restored window empty.
+    return toRestorePayload(loadSession()?.windows?.[0] ?? null);
   });
   // Settings persistence (issue #19) — file-backed in %APPDATA%\wmux so prefs
   // survive portable-zip updates. get-all is synchronous so the renderer's
@@ -333,41 +350,122 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
   // the file applying the SAME guards as the markdown.load_file pipe handler
   // (extension whitelist + 5 MB cap) so the manual path can't slurp secrets.
   ipcMain.handle(IPC_CHANNELS.MARKDOWN_OPEN_FILE, async (event) => {
-    const ALLOWED_MD_EXT = new Set(['.md', '.markdown', '.mdx', '.txt', '.text', '.rst']);
-    const MAX_MD_BYTES = 5 * 1024 * 1024;
     const win = BrowserWindow.fromWebContents(event.sender) ?? undefined;
     const result = await dialog.showOpenDialog(win as BrowserWindow, {
       title: 'Open Markdown File',
       properties: ['openFile'],
       filters: [
-        { name: 'Markdown / Text', extensions: ['md', 'markdown', 'mdx', 'txt', 'text', 'rst'] },
+        { name: 'Markdown / Text', extensions: MD_DIALOG_EXTENSIONS },
         { name: 'All Files', extensions: ['*'] },
       ],
     });
     if (result.canceled || result.filePaths.length === 0) {
       return { canceled: true };
     }
-    const filePath = result.filePaths[0];
-    const ext = path.extname(filePath).toLowerCase();
-    if (!ALLOWED_MD_EXT.has(ext)) {
-      return { error: `Unsupported file type: ${ext || '(none)'}` };
-    }
-    let stat: fs.Stats;
-    try { stat = fs.statSync(filePath); } catch { return { error: 'File not found' }; }
-    if (!stat.isFile() || stat.size > MAX_MD_BYTES) {
-      return { error: 'File is not a regular file or exceeds 5MB limit' };
-    }
-    try {
-      const content = fs.readFileSync(filePath, 'utf-8');
-      return { filePath, content };
-    } catch (err: any) {
-      return { error: err?.message || 'Failed to read file' };
-    }
+    // The "All Files" filter lets the user pick anything, so the whitelist still
+    // has to be enforced after the dialog — the filter is a convenience, not a guard.
+    const read = readMarkdownFile(result.filePaths[0]);
+    // The user chose this file in a native dialog, so editing and saving it back
+    // is what they asked for. That consent is what the grant set records (F3).
+    if (!('error' in read)) grantMarkdownPath(event.sender.id, read.filePath);
+    return read;
   });
+
+  // Markdown viewer (issue #116): re-read a file the pane already knows about.
+  // Backs "Reload from disk" (agents rewrite files under the pane constantly)
+  // and drag-and-drop of a file onto a markdown pane. Same guards as every
+  // other read — the renderer supplies the path, so it is treated as untrusted.
+  ipcMain.handle(IPC_CHANNELS.MARKDOWN_READ_FILE, async (_event, filePath: string) => {
+    return readMarkdownFile(filePath);
+  });
+
+  // Markdown viewer (issue #116): the two read-only shell actions on the backing
+  // file. Both are gated on the extension whitelist — without it, `openPath` on
+  // a renderer-supplied path is an arbitrary-program launcher, which is a much
+  // bigger capability than "open the doc I'm reading in Typora".
+  ipcMain.handle(IPC_CHANNELS.MARKDOWN_REVEAL, async (_event, filePath: string) => {
+    if (!isAllowedMarkdownPath(filePath)) return { error: 'Unsupported file type', code: 'unsupported_type' };
+    shell.showItemInFolder(filePath);
+    return { ok: true };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.MARKDOWN_OPEN_IN_APP, async (_event, filePath: string) => {
+    if (!isAllowedMarkdownPath(filePath)) return { error: 'Unsupported file type', code: 'unsupported_type' };
+    const err = await shell.openPath(filePath);
+    return err ? { error: err, code: 'action_failed' } : { ok: true };
+  });
+
+  // Markdown editing (issue #116, F3). Re-stat only — backs the on-focus
+  // "changed on disk?" check, which needs the mtime and not the content.
+  ipcMain.handle(IPC_CHANNELS.MARKDOWN_STAT_FILE, async (_event, filePath: string) => {
+    return statMarkdownFile(filePath);
+  });
+
+  // Save in place. The path comes from the renderer's store, so it is only
+  // honoured if it is in this window's grant set — see ./markdown-grants for
+  // why a renderer-supplied write path is treated as attacker-controlled.
+  ipcMain.handle(
+    IPC_CHANNELS.MARKDOWN_SAVE_FILE,
+    async (event, filePath: string, content: string, expectedMtimeMs?: number) => {
+      if (!isMarkdownPathGranted(event.sender.id, filePath)) {
+        return { error: 'This file was not opened in wmux — use Save As', code: 'not_granted' };
+      }
+      return writeMarkdownFile(filePath, content, expectedMtimeMs);
+    },
+  );
+
+  // Save As: the native dialog is the user's consent, so a confirmed
+  // destination both gets written and becomes a grant for later in-place saves.
+  ipcMain.handle(
+    IPC_CHANNELS.MARKDOWN_SAVE_AS,
+    async (event, content: string, suggestedName?: string, defaultDir?: string) => {
+      const win = BrowserWindow.fromWebContents(event.sender) ?? undefined;
+      const result = await dialog.showSaveDialog(win as BrowserWindow, {
+        title: 'Save Markdown File',
+        defaultPath: suggestedName
+          ? path.join(defaultDir || '', suggestedName)
+          : path.join(defaultDir || '', 'untitled.md'),
+        filters: [{ name: 'Markdown / Text', extensions: MD_DIALOG_EXTENSIONS }],
+      });
+      if (result.canceled || !result.filePath) return { canceled: true };
+      const written = writeMarkdownFile(result.filePath, content);
+      if ('ok' in written) {
+        grantMarkdownPath(event.sender.id, result.filePath);
+        return { ...written, filePath: result.filePath };
+      }
+      return written;
+    },
+  );
 
   // Folder picker (issue #64): backs the `openFolder` shortcut (Ctrl+O). Shows a
   // native directory dialog and returns the chosen path; the renderer opens a new
   // workspace rooted there. Previously `openFolder` was a bound-but-no-op stub.
+  // "Open in wmux" Explorer verb (HKCU shell keys — see shell-context-menu.ts).
+  ipcMain.handle(IPC_CHANNELS.SYSTEM_GET_CONTEXT_MENU, () => {
+    try {
+      return isContextMenuInstalled();
+    } catch {
+      return false;
+    }
+  });
+
+  ipcMain.handle(IPC_CHANNELS.SYSTEM_SET_CONTEXT_MENU, (_event, enabled: boolean, label?: string) => {
+    try {
+      if (enabled) {
+        // app.getPath('exe') is Electron's own binary in dev, which is correct:
+        // the verb then launches the dev build, and the user gets what they see.
+        installContextMenu(app.getPath('exe'), label || 'Open in wmux');
+      } else {
+        uninstallContextMenu();
+      }
+      // Report the state actually achieved, not the state requested — a partial
+      // registry write must not leave the toggle claiming success.
+      return { ok: true, enabled: isContextMenuInstalled() };
+    } catch (err) {
+      return { ok: false, enabled: isContextMenuInstalled(), error: (err as Error).message };
+    }
+  });
+
   ipcMain.handle(IPC_CHANNELS.SYSTEM_PICK_FOLDER, async (event) => {
     const win = BrowserWindow.fromWebContents(event.sender) ?? undefined;
     const result = await dialog.showOpenDialog(win as BrowserWindow, {

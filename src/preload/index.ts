@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
+import * as os from 'os';
 import { IPC_CHANNELS } from '../shared/types';
 
 contextBridge.exposeInMainWorld('wmux', {
@@ -30,12 +31,21 @@ contextBridge.exposeInMainWorld('wmux', {
   },
   system: {
     platform: 'win32' as const,
+    // Home directory, read once at preload time. Exposed as a plain string
+    // rather than an IPC round-trip because the markdown path chip (issue #116)
+    // needs it during render to shorten `C:\Users\me\notes.md` → `~\notes.md`.
+    homeDir: os.homedir(),
     getShells: () => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_GET_SHELLS),
     getFonts: () => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_GET_FONTS) as Promise<string[]>,
     openExternal: (url: string) => ipcRenderer.send(IPC_CHANNELS.SYSTEM_OPEN_EXTERNAL, url),
     getVersion: () => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_GET_VERSION),
     toggleDevTools: () => ipcRenderer.send('toggle-devtools'),
     pickFolder: () => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_PICK_FOLDER),
+    getContextMenu: () => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_GET_CONTEXT_MENU) as Promise<boolean>,
+    setContextMenu: (enabled: boolean, label?: string) =>
+      ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_SET_CONTEXT_MENU, enabled, label) as Promise<{
+        ok: boolean; enabled: boolean; error?: string;
+      }>,
     getShouldUseDarkColors: () => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_GET_SHOULD_USE_DARK_COLORS) as Promise<boolean>,
     onNativeThemeUpdated: (callback: (shouldUseDarkColors: boolean) => void) => {
       const handler = (_event: any, shouldUseDarkColors: boolean) => callback(shouldUseDarkColors);
@@ -142,6 +152,17 @@ contextBridge.exposeInMainWorld('wmux', {
       ipcRenderer.on(IPC_CHANNELS.UPDATE_AVAILABLE, handler);
       return () => ipcRenderer.removeListener(IPC_CHANNELS.UPDATE_AVAILABLE, handler);
     },
+    // Issue #125 — download and install without leaving the app. Resolves
+    // { handled: false } when this build can't self-update, which is the
+    // renderer's cue to fall back to openRelease().
+    install: (): Promise<{ handled: boolean; reason?: string }> =>
+      ipcRenderer.invoke(IPC_CHANNELS.UPDATE_INSTALL),
+    getState: () => ipcRenderer.invoke(IPC_CHANNELS.UPDATE_GET_STATE),
+    onState: (callback: (state: { phase: string; version: string | null; percent: number; message?: string }) => void) => {
+      const handler = (_event: any, state: any) => callback(state);
+      ipcRenderer.on(IPC_CHANNELS.UPDATE_STATE, handler);
+      return () => ipcRenderer.removeListener(IPC_CHANNELS.UPDATE_STATE, handler);
+    },
   },
   hook: {
     onEvent: (callback: (event: any) => void) => {
@@ -155,6 +176,14 @@ contextBridge.exposeInMainWorld('wmux', {
       const handler = (_event: any, data: any) => callback(data);
       ipcRenderer.on(IPC_CHANNELS.CLAUDE_ACTIVITY, handler);
       return () => ipcRenderer.removeListener(IPC_CHANNELS.CLAUDE_ACTIVITY, handler);
+    },
+  },
+  // Declared agent run state — blocked / working / idle (issue #128).
+  agentState: {
+    onUpdate: (callback: (data: any) => void) => {
+      const handler = (_event: any, data: any) => callback(data);
+      ipcRenderer.on(IPC_CHANNELS.AGENT_STATE, handler);
+      return () => ipcRenderer.removeListener(IPC_CHANNELS.AGENT_STATE, handler);
     },
   },
   orchestration: {
@@ -186,6 +215,22 @@ contextBridge.exposeInMainWorld('wmux', {
     // Manual "open markdown file" entry point (issue #54): native file picker +
     // guarded read in the main process. Returns { filePath, content } | { canceled } | { error }.
     openFile: () => ipcRenderer.invoke(IPC_CHANNELS.MARKDOWN_OPEN_FILE),
+    // Path-aware surfaces (issue #116). readFile backs "reload from disk" and
+    // drag-and-drop onto a markdown pane; reveal/openInApp are the read-only
+    // shell actions on the backing file. All three re-apply the main-process
+    // guards — the path travels renderer→main and is never trusted.
+    readFile: (filePath: string) => ipcRenderer.invoke(IPC_CHANNELS.MARKDOWN_READ_FILE, filePath),
+    reveal: (filePath: string) => ipcRenderer.invoke(IPC_CHANNELS.MARKDOWN_REVEAL, filePath),
+    openInApp: (filePath: string) => ipcRenderer.invoke(IPC_CHANNELS.MARKDOWN_OPEN_IN_APP, filePath),
+    // Edit & save (issue #116, F3). saveFile writes in place and is refused
+    // unless the path is in this window's grant set; saveAs shows a native
+    // dialog, which is both the write target and the consent that mints the
+    // grant. statFile is the cheap "did it change under me?" re-check.
+    statFile: (filePath: string) => ipcRenderer.invoke(IPC_CHANNELS.MARKDOWN_STAT_FILE, filePath),
+    saveFile: (filePath: string, content: string, expectedMtimeMs?: number) =>
+      ipcRenderer.invoke(IPC_CHANNELS.MARKDOWN_SAVE_FILE, filePath, content, expectedMtimeMs),
+    saveAs: (content: string, suggestedName?: string, defaultDir?: string) =>
+      ipcRenderer.invoke(IPC_CHANNELS.MARKDOWN_SAVE_AS, content, suggestedName, defaultDir),
   },
   diff: {
     getFiles: (cwd: string) => ipcRenderer.invoke(IPC_CHANNELS.DIFF_GET_FILES, cwd),

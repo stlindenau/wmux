@@ -11,6 +11,7 @@ release/
 
 # Local Claude Code settings
 .claude/settings.local.json
+build-icons.log
 
 # Python (wmux command server)
 __pycache__/

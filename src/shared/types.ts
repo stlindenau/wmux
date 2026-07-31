@@ -33,6 +33,24 @@ export interface SurfaceRef {
    *  instead of the generic "Markdown" so multiple markdown tabs are
    *  distinguishable. Only set when the surface was populated from a file. */
   markdownFileName?: string;
+  /** Absolute path of the file backing a `markdown` surface (issue #116). Shown
+   *  in the pane toolbar, copyable, and what "reload from disk" re-reads.
+   *  Deliberately absent for content pushed via `markdown.set_content` or an
+   *  empty Ctrl+Shift+M scratch surface — pathless is a first-class state, not
+   *  an error, since agent-pushed content is the original use case. */
+  markdownFilePath?: string;
+  /** Preview (rendered) vs source (raw, line-numbered) view of a `markdown`
+   *  surface (issue #116). Persisted for the same reason as `markdownContent`:
+   *  split-tree restructures remount the pane and would otherwise reset it. */
+  markdownViewMode?: 'preview' | 'source';
+  /** mtime of the backing file as of the last successful load or save (F3).
+   *  Compared before overwriting so an agent rewriting the file under the pane
+   *  is caught instead of silently losing to whoever saves last. */
+  markdownFileMtime?: number;
+  /** Buffer differs from what is on disk (F3). Shown as a `•` on the tab and
+   *  confirmed before closing. Persisted with the content, so an unsaved edit
+   *  survives a restart — and comes back still marked unsaved. */
+  markdownDirty?: boolean;
 }
 
 /**
@@ -295,6 +313,8 @@ export const IPC_CHANNELS = {
   SYSTEM_OPEN_EXTERNAL: 'system:openExternal',
   SYSTEM_GET_VERSION: 'system:getVersion',
   SYSTEM_PICK_FOLDER: 'system:pickFolder',
+  SYSTEM_GET_CONTEXT_MENU: 'system:getContextMenu',
+  SYSTEM_SET_CONTEXT_MENU: 'system:setContextMenu',
   SYSTEM_GET_SHOULD_USE_DARK_COLORS: 'system:getShouldUseDarkColors',
   SYSTEM_NATIVE_THEME_UPDATED: 'system:nativeThemeUpdated',
   // Metadata events (main → renderer)
@@ -324,6 +344,8 @@ export const IPC_CHANNELS = {
   HOOK_EVENT: 'hook:event',
   // Claude Code activity (parsed from PTY output → renderer)
   CLAUDE_ACTIVITY: 'claude:activity',
+  // Declared agent run state (pane.report_agent → main → renderer, issue #128)
+  AGENT_STATE: 'agent:state',
   // Named sessions
   SESSION_SAVE_NAMED: 'session:save-named',
   SESSION_LOAD_NAMED: 'session:load-named',
@@ -337,13 +359,31 @@ export const IPC_CHANNELS = {
   DIFF_UPDATE: 'diff:update',
   // Markdown viewer (issue #54) — file picker for the manual "open markdown" UI
   MARKDOWN_OPEN_FILE: 'markdown:open-file',
+  // Markdown viewer (issue #116) — path-aware surfaces: re-read a known file
+  // (reload / drag-and-drop) plus the two read-only shell actions. All three go
+  // through the guards in main/markdown-file.ts.
+  MARKDOWN_READ_FILE: 'markdown:read-file',
+  MARKDOWN_REVEAL: 'markdown:reveal',
+  MARKDOWN_OPEN_IN_APP: 'markdown:open-in-app',
+  // F3 (issue #116) — the first renderer→disk writes in this surface. Both go
+  // through the grant set in ./markdown-grants; save-as is also what mints a
+  // grant for a surface that had no backing file.
+  MARKDOWN_SAVE_FILE: 'markdown:save-file',
+  MARKDOWN_SAVE_AS: 'markdown:save-as',
+  MARKDOWN_STAT_FILE: 'markdown:stat-file',
   // Orchestration (wmux-orchestrator plugin state broadcast)
   ORCHESTRATION_UPDATE: 'orchestration:update',
   ORCHESTRATION_CLEAR: 'orchestration:clear',
-  // App update notification (GitHub releases polling — opens OS browser on click)
+  // App update notification (GitHub releases polling — badge in the titlebar)
   UPDATE_AVAILABLE: 'update:available',
   UPDATE_GET_LATEST: 'update:get-latest',
   UPDATE_OPEN_RELEASE: 'update:open-release',
+  // In-app download/install driven by the badge (issue #125). UPDATE_INSTALL
+  // starts (or confirms) the flow; UPDATE_STATE streams checking → downloading
+  // → ready back to the badge.
+  UPDATE_INSTALL: 'update:install',
+  UPDATE_GET_STATE: 'update:get-state',
+  UPDATE_STATE: 'update:state',
 } as const;
 
 // ─── Orchestration state (wmux-orchestrator plugin) ────────────────────────

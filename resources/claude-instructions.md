@@ -10,10 +10,10 @@ For any web browsing task, use the `wmux browser` commands so the user can watch
 
 ```bash
 wmux browser open <url>          # navigate
-wmux browser snapshot            # get accessibility tree with @eN refs
-wmux browser click @eN           # click element
-wmux browser type @eN <text>     # type into element
-wmux browser fill @eN <value>    # set input value
+wmux browser snapshot            # get accessibility tree with eN refs
+wmux browser click eN           # click element
+wmux browser type eN <text>     # type into element
+wmux browser fill eN <value>    # set input value
 wmux browser get-text            # get page text
 wmux browser screenshot          # capture screenshot
 wmux browser eval <js>           # run JavaScript
@@ -22,9 +22,9 @@ wmux browser forward             # go forward
 wmux browser reload              # reload page
 ```
 
-Workflow: `browser open <url>` → `browser snapshot` → read tree → `browser click/type @eN` → `browser snapshot` again.
+Workflow: `browser open <url>` → `browser snapshot` → read tree → `browser click/type eN` → `browser snapshot` again.
 
-Refs (`@e1`, `@e2`...) expire after page changes — always re-snapshot.
+Refs (`e1`, `e2`...) expire after page changes — always re-snapshot.
 
 ## Markdown
 
@@ -34,6 +34,8 @@ To let the user review a markdown document — your plan-mode plan, a spec, a de
 wmux markdown <file>             # open a .md/.markdown/.mdx/.txt/.rst file in a new markdown view
 wmux markdown set <id> --content "# Title\n..."   # set content of an existing markdown surface
 wmux markdown set <id> --file <path>              # load a file into an existing markdown surface
+wmux markdown set <id> --content "..." --title T # label the tab (pushed content stays pathless)
+wmux markdown get <id>                           # read a surface's buffer back out
 ```
 
 Relative paths resolve against your current working directory. Only text/markdown files up to 5 MB are accepted. Prefer this over pasting long markdown into the terminal so the user can read it comfortably in a pane.

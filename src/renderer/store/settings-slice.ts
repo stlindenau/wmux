@@ -1,6 +1,6 @@
 import { StateCreator } from 'zustand';
 import { QuickLaunchProfile } from '../../shared/types';
-import { Language, detectDefaultLanguage } from '../i18n/core';
+import { Language, detectDefaultLanguage, isLanguage } from '../i18n/core';
 
 // ─── Persistence helpers (issue #12 + issue #15 + issue #19) ─────────────────
 // Zustand has no persistence middleware here, so any pref that lives only in
@@ -93,7 +93,9 @@ function loadPersistedLanguage(): Language {
       }
     } catch { /* localStorage unavailable */ }
   }
-  if (candidate === 'en' || candidate === 'fr' || candidate === 'zh') return candidate;
+  // isLanguage() derives from the i18n registry: a newly shipped language is
+  // accepted here automatically instead of silently resetting on next launch.
+  if (isLanguage(candidate)) return candidate;
   return detectDefaultLanguage();
 }
 
@@ -170,7 +172,9 @@ export type ShortcutAction =
   | 'broadcastInput'
   | 'togglePinWorkspace'
   | 'markWorkspaceRead'
-  | 'toggleShortcutCheatSheet';
+  | 'toggleShortcutCheatSheet'
+  // ─── issue #116 ───────────────────────────────────────────────────────────
+  | 'toggleMarkdownSource';
 
 // ─── Default shortcuts ────────────────────────────────────────────────────────
 
@@ -230,6 +234,11 @@ export const DEFAULT_SHORTCUTS: Record<ShortcutAction, ShortcutBinding> = {
   togglePinWorkspace:     { key: 'p', ctrl: true, alt: true },
   markWorkspaceRead:      { key: 'r', ctrl: true, alt: true },
   toggleShortcutCheatSheet: { key: 'F1' },
+  // ─── issue #116 ─────────────────────────────────────────────────────────────
+  // Ctrl+Shift+E was unbound. Shift-modified, so isSafeToIntercept lets it
+  // through without touching SAFE_CTRL_KEYS; a no-op unless the focused pane's
+  // active surface is markdown.
+  toggleMarkdownSource:   { key: 'e', ctrl: true, shift: true },
 };
 
 // ─── Sidebar settings ─────────────────────────────────────────────────────────
@@ -386,6 +395,15 @@ export interface AppearancePrefs {
   customBackground: string;
   /** 30–100 (%). How opaque the terminal theme background stays over the custom background. */
   terminalBgOpacity: number;
+  /**
+   * Sidebar presentation mode. 'classic' is the stock list; 'trace' is the
+   * opt-in live view that renders each Claude session as a tap on a copper bus,
+   * with motion driven by real hook traffic.
+   *
+   * A separate axis from `uiTheme` on purpose — TRACE composes with both dark
+   * and light rather than being a third theme.
+   */
+  uiMode: 'classic' | 'trace';
 }
 
 export const DEFAULT_APPEARANCE_PREFS: AppearancePrefs = {
@@ -396,6 +414,10 @@ export const DEFAULT_APPEARANCE_PREFS: AppearancePrefs = {
   customBackgroundEnabled: false,
   customBackground: '',
   terminalBgOpacity: 88,
+  // Persisted state is built as { ...DEFAULTS, ...loadPersisted() }, so every
+  // existing user lands on 'classic' without a migration. The "opting in never
+  // happens by accident" guarantee is structural, not a thing to remember.
+  uiMode: 'classic',
 };
 
 // ─── Slice interface ──────────────────────────────────────────────────────────

@@ -8,12 +8,15 @@ import { ImageAddon } from '@xterm/addon-image';
 import { SerializeAddon } from '@xterm/addon-serialize';
 import { ProgressAddon } from '@xterm/addon-progress';
 import { useStore } from '../store';
+import { useT } from '../i18n';
 import { collectActiveTerminalSurfaceIds } from '../store/split-utils';
 import { SplitNode, ThemeConfig } from '../../shared/types';
 import { UserColorScheme } from '../store/settings-slice';
 import { openInWmuxBrowser } from '../utils/open-in-browser';
 import { attachVisibleRenderer, RendererHandle } from '../utils/terminal-renderer';
 import { trimTrailingWhitespace } from '../utils/copy-text';
+import { handleShiftEnter, isShiftEnter } from './terminal-keys';
+import { isConEmuSubcommand } from './osc9';
 import '@xterm/xterm/css/xterm.css';
 
 declare global {
@@ -331,6 +334,7 @@ async function fetchTheme(name: string): Promise<ThemeConfig> {
 }
 
 export function useTerminal({ surfaceId, shell, cwd, visible = true, focused = true, colorScheme, startupCommands }: UseTerminalOptions = {}): UseTerminalResult {
+  const t = useT();
   const terminalRef = useRef<HTMLDivElement | null>(null);
   const xtermRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -565,6 +569,18 @@ export function useTerminal({ surfaceId, shell, cwd, visible = true, focused = t
     // Register OSC notification handlers
     // OSC 9: basic notification (iTerm2 style)
     terminal.parser.registerOscHandler(9, (data) => {
+      // ConEmu/Windows Terminal overload OSC 9 with numeric subcommands —
+      // "9;<cwd>" (our own cmd integration and the standard WT PowerShell
+      // prompt snippet emit this on EVERY prompt redraw) and "4;<state>;<n>"
+      // (progress). Only bare text is an iTerm2 notification (#127).
+      //
+      // Return FALSE, not true: xterm runs OSC handlers newest-first and stops
+      // at the first one returning true. ProgressAddon also registers on OSC 9
+      // but is loaded earlier (above), so this handler always sees the sequence
+      // first — swallowing it with `true` starved the addon and the OSC 9;4
+      // progress bar never fired at all (dead since it shipped in 0.23.0).
+      // Declining passes the sequence down the chain to the addon.
+      if (isConEmuSubcommand(data)) return false;
       window.wmux.notification.fire({
         surfaceId: ptyIdRef.current || '',
         text: data,
@@ -613,7 +629,7 @@ export function useTerminal({ surfaceId, shell, cwd, visible = true, focused = t
       lastBellAt = now;
       window.wmux.notification.fire({
         surfaceId: ptyIdRef.current || '',
-        text: 'Terminal bell',
+        text: t('terminal.bell', 'Terminal bell'),
       });
     });
 
@@ -692,24 +708,13 @@ export function useTerminal({ surfaceId, shell, cwd, visible = true, focused = t
         })();
         return false; // Prevent default — we handle paste ourselves
       }
-      // Shift+Enter → newline for TUI apps (Claude Code, etc). xterm sends a
-      // plain \r for BOTH Enter and Shift+Enter, so the app can't tell them
-      // apart and treats Shift+Enter as submit. Emit ESC+CR — the same sequence
-      // Alt/Option+Enter produces and that Claude Code's /terminal-setup wires
-      // up — so Shift+Enter inserts a newline instead of submitting. Excludes
-      // Ctrl/Alt/Meta so Ctrl+Shift+Enter (zoom pane) is left untouched.
-      if (
-        event.type === 'keydown' &&
-        event.key === 'Enter' &&
-        event.shiftKey &&
-        !event.ctrlKey &&
-        !event.altKey &&
-        !event.metaKey
-      ) {
-        // Route through terminal.input() (→ onData) rather than pty.write so
-        // broadcast-input mode (issue #64) fans the newline out like any key.
-        terminal.input('\x1b\r', true);
-        return false;
+      // Shift+Enter → newline for TUI apps (Claude Code, etc). See
+      // ./terminal-keys for why this cancels the event as well as returning
+      // false (issue #119). Routed through terminal.input() (→ onData) rather
+      // than pty.write so broadcast-input mode (issue #64) fans the newline out
+      // like any other key.
+      if (isShiftEnter(event)) {
+        return handleShiftEnter(event, (data) => terminal.input(data, true));
       }
       return true;
     });

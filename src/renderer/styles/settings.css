@@ -107,13 +107,13 @@
 }
 
 .settings-tab--active {
-  background: rgba(0, 145, 255, 0.18);
-  color: #0091FF;
+  background: rgba(var(--ui-accent-rgb), 0.18);
+  color: var(--ui-accent);
 }
 
 .settings-tab--active:hover {
-  background: rgba(0, 145, 255, 0.24);
-  color: #0091FF;
+  background: rgba(var(--ui-accent-rgb), 0.24);
+  color: var(--ui-accent);
 }
 
 /* ─── Content area ────────────────────────────────────────────────────────── */
@@ -189,7 +189,7 @@
   width: 36px;
   height: 20px;
   cursor: pointer;
-  accent-color: #0091FF;
+  accent-color: var(--ui-accent);
   flex-shrink: 0;
 }
 
@@ -207,7 +207,7 @@
 }
 
 .settings-select:focus {
-  border-color: #0091FF;
+  border-color: var(--ui-accent);
 }
 
 .settings-input {
@@ -228,13 +228,13 @@
 }
 
 .settings-input:focus {
-  border-color: #0091FF;
+  border-color: var(--ui-accent);
 }
 
 .settings-slider {
   width: 100%;
   margin-top: 8px;
-  accent-color: #0091FF;
+  accent-color: var(--ui-accent);
   cursor: pointer;
 }
 
@@ -309,6 +309,56 @@
   padding-top: 8px;
 }
 
+.shortcut-search-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.shortcut-search {
+  flex: 1;
+  min-width: 0;
+}
+
+.shortcut-filter-capture {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+
+.shortcut-filter-capture__clear {
+  background: none;
+  border: none;
+  padding: 0 4px;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  color: rgba(var(--ui-overlay-rgb), 0.45);
+  transition: color 0.1s;
+}
+
+.shortcut-filter-capture__clear:hover {
+  color: var(--ui-text-primary);
+}
+
+.shortcut-group-title {
+  margin: 0 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ui-accent);
+}
+
+.shortcut-empty {
+  padding: 24px;
+  text-align: center;
+  color: rgba(var(--ui-overlay-rgb), 0.4);
+  font-size: 13px;
+}
+
 /* ─── Shortcut recorder ───────────────────────────────────────────────────── */
 
 .shortcut-recorder {
@@ -317,7 +367,8 @@
   gap: 8px;
 }
 
-.shortcut-recorder__btn {
+.shortcut-recorder__btn,
+.shortcut-filter-capture__btn {
   padding: 3px 10px;
   min-width: 130px;
   text-align: center;
@@ -331,21 +382,37 @@
   transition: border-color 0.1s, background 0.1s;
 }
 
-.shortcut-recorder__btn:hover {
-  border-color: rgba(0, 145, 255, 0.5);
+.shortcut-recorder__btn:hover,
+.shortcut-filter-capture__btn:hover {
+  border-color: rgba(var(--ui-accent-rgb), 0.5);
   background: var(--ui-bg-5);
 }
 
-.shortcut-recorder__btn--recording {
-  border-color: #0091FF;
-  background: rgba(0, 145, 255, 0.1);
-  color: #0091FF;
+.shortcut-recorder__btn--recording,
+.shortcut-filter-capture__btn--listening {
+  border-color: var(--ui-accent);
+  background: rgba(var(--ui-accent-rgb), 0.1);
+  color: var(--ui-accent);
   animation: shortcut-pulse 1s ease-in-out infinite;
 }
 
 @keyframes shortcut-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.6; }
+}
+
+/* Idle text is prose ("Search by shortcut…"), so inherit the UI font and only
+   switch to the recorder's monospace once a real combo is showing. */
+.shortcut-filter-capture__btn {
+  font-family: inherit;
+  min-width: 156px;
+  white-space: nowrap;
+}
+
+.shortcut-filter-capture__btn--set {
+  font-family: 'Consolas', 'Menlo', monospace;
+  border-color: rgba(var(--ui-accent-rgb), 0.5);
+  color: var(--ui-accent);
 }
 
 .shortcut-recorder__conflict {

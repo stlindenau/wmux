@@ -31,6 +31,38 @@ export interface SurfaceSlice {
   closeSurface: (workspaceId: WorkspaceId, paneId: PaneId, surfaceId: SurfaceId) => void;
 
   /**
+   * The path behind every USER close gesture for a tab (the tab ×, Ctrl+W).
+   * Closes immediately unless the surface holds unsaved markdown edits (issue
+   * #116, F3), in which case it parks the request in `pendingCloseSurface` for
+   * the confirmation dialog. Programmatic closes (`wmux close-surface`) call
+   * closeSurface directly and never see the dialog — a CLI call must not block
+   * on a modal nobody is looking at.
+   *
+   * reopenClosedSurface (Ctrl+Shift+T) does make an accidental close
+   * recoverable, but "recoverable via a shortcut you may not know" is not good
+   * enough for text the user typed.
+   */
+  requestCloseSurface: (workspaceId: WorkspaceId, paneId: PaneId, surfaceId: SurfaceId) => void;
+  pendingCloseSurface: { workspaceId: WorkspaceId; paneId: PaneId; surfaceId: SurfaceId; label: string } | null;
+  confirmPendingCloseSurface: () => void;
+  cancelPendingCloseSurface: () => void;
+
+  /**
+   * Close a whole pane, reaping every shell it holds.
+   *
+   * Lives in the store rather than in PaneWrapper so the UI button, `wmux
+   * close-pane` and closeSurface's last-tab path share ONE implementation —
+   * the same reasoning pty-teardown.ts records for PTY reaping. The three
+   * copies this replaces had each independently gotten the last-pane case
+   * wrong, in the same way.
+   *
+   * Closing the workspace's only pane closes the workspace: a workspace with
+   * zero panes cannot be rendered, and `removeLeaf` correctly reports that
+   * nothing is left.
+   */
+  closePane: (workspaceId: WorkspaceId, paneId: PaneId) => void;
+
+  /**
    * Open a copy of a surface in the same pane: same type, shell, color and
    * (current) directory, but a fresh instance. Returns the new SurfaceId, or
    * null if the source no longer exists.
@@ -76,8 +108,18 @@ export interface SurfaceSlice {
    * Set rendered markdown content on a surface, found by id across all
    * workspaces/panes (issue #54). Callers from the pipe bridge only know the
    * surfaceId, so this locates the owning pane itself.
+   *
+   * Takes an options object rather than positional args (issue #116) so the
+   * next field doesn't become a fourth parameter. A bare string is still
+   * accepted as `fileName` for compatibility with the `executeJavaScript`
+   * call the main process emits, which may be from an older build during a
+   * hot-swap.
    */
-  setMarkdownContent: (surfaceId: SurfaceId, content: string, fileName?: string) => void;
+  setMarkdownContent: (
+    surfaceId: SurfaceId,
+    content: string,
+    options?: string | { fileName?: string; filePath?: string; mtimeMs?: number; dirty?: boolean },
+  ) => void;
 
   /** Split a pane and move a surface into the new pane (drag to edge) */
   splitAndMoveSurface: (
@@ -87,6 +129,36 @@ export interface SurfaceSlice {
     surfaceId: SurfaceId,
     direction: 'left' | 'right' | 'up' | 'down',
   ) => void;
+}
+
+/**
+ * Build the surface patch for a markdown content update.
+ *
+ * The subtle rule is which fields a content-only push is allowed to touch. Only
+ * a load *from a file* may set the tab label and backing path — otherwise
+ * `wmux markdown set --content` against a file-backed surface would silently
+ * re-point or clear the path it saves and reloads from.
+ *
+ * Dirty state follows the same reasoning (F3, issue #116): a load from disk
+ * carries an mtime and leaves the buffer clean, while pushing text into a
+ * file-backed surface makes the buffer differ from disk — which is a user edit
+ * in every way that matters, so it is marked dirty rather than auto-written.
+ */
+export function markdownContentPatch(
+  existing: SurfaceRef,
+  content: string,
+  opts: { fileName?: string; filePath?: string; mtimeMs?: number; dirty?: boolean } = {},
+): Partial<SurfaceRef> {
+  const patch: Partial<SurfaceRef> = { markdownContent: content };
+  if (opts.fileName) patch.markdownFileName = opts.fileName;
+  if (opts.filePath) patch.markdownFilePath = opts.filePath;
+  if (opts.mtimeMs !== undefined) patch.markdownFileMtime = opts.mtimeMs;
+  if (opts.dirty !== undefined) {
+    patch.markdownDirty = opts.dirty;
+  } else {
+    patch.markdownDirty = !opts.filePath && !!existing.markdownFilePath;
+  }
+  return patch;
 }
 
 // ─── Helper: update a leaf's surfaces in the split tree ──────────────────────
@@ -126,7 +198,7 @@ function pushClosedSurface(surface: SurfaceRef): void {
 
 // ─── Slice creator ───────────────────────────────────────────────────────────
 
-export const createSurfaceSlice: StateCreator<SliceState, [], [], SurfaceSlice> = (_set, get) => ({
+export const createSurfaceSlice: StateCreator<SliceState, [], [], SurfaceSlice> = (set, get) => ({
   addSurface(workspaceId, paneId, type, options) {
     const surfaceId: SurfaceId = `surf-${uuid()}` as SurfaceId;
 
@@ -182,6 +254,36 @@ export const createSurfaceSlice: StateCreator<SliceState, [], [], SurfaceSlice> 
     });
   },
 
+  pendingCloseSurface: null,
+
+  requestCloseSurface(workspaceId, paneId, surfaceId) {
+    const { workspaces, closeSurface } = get();
+    const ws = workspaces.find((w) => w.id === workspaceId);
+    const surface = ws && findLeaf(ws.splitTree, paneId)?.surfaces.find((s) => s.id === surfaceId);
+    if (!surface?.markdownDirty) {
+      closeSurface(workspaceId, paneId, surfaceId);
+      return;
+    }
+    set({
+      pendingCloseSurface: {
+        workspaceId,
+        paneId,
+        surfaceId,
+        label: surface.markdownFileName || 'this note',
+      },
+    });
+  },
+
+  confirmPendingCloseSurface() {
+    const pending = get().pendingCloseSurface;
+    set({ pendingCloseSurface: null });
+    if (pending) get().closeSurface(pending.workspaceId, pending.paneId, pending.surfaceId);
+  },
+
+  cancelPendingCloseSurface() {
+    set({ pendingCloseSurface: null });
+  },
+
   closeSurface(workspaceId, paneId, surfaceId) {
     const { workspaces, updateSplitTree } = get();
     const ws = workspaces.find((w) => w.id === workspaceId);
@@ -203,13 +305,12 @@ export const createSurfaceSlice: StateCreator<SliceState, [], [], SurfaceSlice> 
     const newSurfaces = leaf.surfaces.filter((s) => s.id !== surfaceId);
 
     if (newSurfaces.length === 0) {
-      // No surfaces left — remove the pane entirely
-      const newTree = removeLeaf(ws.splitTree, paneId);
-      if (newTree) {
-        updateSplitTree(workspaceId, newTree);
-      }
-      // If newTree is null the workspace has no panes; leave it intact
-      // (workspace-level empty state is handled elsewhere)
+      // Last tab in the pane — this is a pane close, so use the pane close.
+      // It was previously inlined here and got the single-pane case wrong:
+      // removeLeaf returns null for a one-leaf tree, `if (newTree)` skipped the
+      // update, and the function returned having ALREADY reaped the shell above
+      // — leaving a dead tab that could never be closed.
+      get().closePane(workspaceId, paneId);
       return;
     }
 
@@ -221,6 +322,35 @@ export const createSurfaceSlice: StateCreator<SliceState, [], [], SurfaceSlice> 
     });
 
     updateSplitTree(workspaceId, updatedTree);
+  },
+
+  closePane(workspaceId, paneId) {
+    const { workspaces, updateSplitTree, closeWorkspace } = get();
+    const ws = workspaces.find((w) => w.id === workspaceId);
+    if (!ws) return;
+
+    const leaf = findLeaf(ws.splitTree, paneId);
+    if (!leaf) return;
+
+    // ORDER IS THE WHOLE FIX: decide BEFORE destroying anything.
+    //
+    // All three previous copies killed the pane's PTYs first and only then asked
+    // removeLeaf what the tree should become. When the answer was null — the
+    // pane was the workspace's only one, which is what `wmux new-workspace`
+    // creates — they read it as "nothing to do" and returned, having already
+    // killed a dev server, an agent and every shell in the pane. The UI was
+    // unchanged, so nothing told the user it had happened.
+    const newTree = removeLeaf(ws.splitTree, paneId);
+
+    if (!newTree) {
+      // Nothing would be left. A workspace with zero panes cannot be rendered,
+      // so this closes the workspace — which reaps the whole subtree itself.
+      closeWorkspace(workspaceId);
+      return;
+    }
+
+    for (const surface of leaf.surfaces) killSurfacePty(surface);
+    updateSplitTree(workspaceId, newTree);
   },
 
   closeOtherSurfaces(workspaceId, paneId, keepSurfaceId) {
@@ -424,19 +554,16 @@ export const createSurfaceSlice: StateCreator<SliceState, [], [], SurfaceSlice> 
     updateSplitTree(workspaceId, updatedTree);
   },
 
-  setMarkdownContent(surfaceId, content, fileName) {
+  setMarkdownContent(surfaceId, content, options) {
     const { workspaces, updateSurface } = get();
+    const opts = typeof options === 'string' ? { fileName: options } : (options ?? {});
     for (const ws of workspaces) {
       for (const paneId of getAllPaneIds(ws.splitTree)) {
         const leaf = findLeaf(ws.splitTree, paneId);
-        if (leaf?.surfaces.some((s) => s.id === surfaceId)) {
-          const patch: Partial<SurfaceRef> = { markdownContent: content };
-          // Only overwrite the tab label when the content came from a file;
-          // content-only setters (e.g. `wmux markdown set`) leave it untouched.
-          if (fileName) patch.markdownFileName = fileName;
-          updateSurface(ws.id, paneId, surfaceId, patch);
-          return;
-        }
+        const existing = leaf?.surfaces.find((s) => s.id === surfaceId);
+        if (!existing) continue;
+        updateSurface(ws.id, paneId, surfaceId, markdownContentPatch(existing, content, opts));
+        return;
       }
     }
   },

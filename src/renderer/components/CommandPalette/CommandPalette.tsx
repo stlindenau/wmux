@@ -80,6 +80,24 @@ export default function CommandPalette({ onClose, onAction }: CommandPaletteProp
       });
     }
 
+    // Sidebar mode toggle. Deliberately a self-executing Commands-style item
+    // rather than a ShortcutAction: the Actions path in App.tsx is a stub that
+    // only console.logs, so anything routed through it silently does nothing.
+    {
+      const nextMode = useStore.getState().appearancePrefs.uiMode === 'trace' ? 'classic' : 'trace';
+      items.push({
+        id: 'command:toggle-ui-mode',
+        label: nextMode === 'trace'
+          ? t('palette.modeTrace', 'Mode: TRACE — live circuit sidebar')
+          : t('palette.modeClassic', 'Mode: Classic sidebar'),
+        category: t('palette.category.commands'),
+        action: () => {
+          useStore.getState().setAppearancePrefs({ uiMode: nextMode });
+          onClose();
+        },
+      });
+    }
+
     // Category: Commands — one-off actions not bound to a shortcut.
     // "Open Markdown File…" picks a file via a native dialog and renders it in a
     // new markdown view (issue #54) — the manual counterpart to `wmux markdown <file>`.
@@ -96,9 +114,13 @@ export default function CommandPalette({ onClose, onAction }: CommandPaletteProp
             const created = (window as any).__wmux_createSurface?.({ type: 'markdown' });
             const surfaceId = created?.surfaceId as string | undefined;
             if (surfaceId) {
-              // Derive the basename for the tab label (renderer has no `path`).
-              const fileName = String(res.filePath || '').replace(/\\/g, '/').split('/').pop() || undefined;
-              useStore.getState().setMarkdownContent(surfaceId as SurfaceId, res.content, fileName);
+              // Derive the basename for the tab label (renderer has no `path`),
+              // and keep the full path so the surface is path-aware (issue #116).
+              // A file picked from a native dialog is exactly the case where the
+              // user may not know where it lives.
+              const filePath = String(res.filePath || '') || undefined;
+              const fileName = (filePath || '').replace(/\\/g, '/').split('/').pop() || undefined;
+              useStore.getState().setMarkdownContent(surfaceId as SurfaceId, res.content, { fileName, filePath, mtimeMs: res.mtimeMs });
             }
           } catch {
             // Dialog/read failures are surfaced via the returned { error }; ignore here.
