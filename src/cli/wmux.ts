@@ -1,5 +1,11 @@
 #!/usr/bin/env node
 
+// Parts of this file are created by genAI.
+// This notice needs to remain attached to any reproduction of or excerpt from this file.
+// Agent: Claude Code
+// AI-assisted: Yes
+// See: docs/AGENTS.md for policy and provenance information
+
 import net from 'net';
 import fs from 'fs';
 import os from 'os';
@@ -655,7 +661,17 @@ async function main() {
   const tokenOverride = getFlag(args, '--token') ?? process.env.WMUX_REMOTE_TOKEN;
   args = stripFlag(stripFlag(args, '--remote'), '--token');
   if (remoteSpec) remoteTarget = parseRemoteTarget(remoteSpec);
-  if (tokenOverride) PIPE_TOKEN = tokenOverride;
+
+  // Token selection: prefer explicit remote token (multi-instance SSH case),
+  // fall back to local pipe token (same-instance bridge case, issue #19).
+  // This allows WMUX_REMOTE to be auto-set for devcontainers without requiring
+  // a redundant WMUX_REMOTE_TOKEN when connecting to the same wmux instance.
+  if (tokenOverride) {
+    PIPE_TOKEN = tokenOverride;
+  } else if (remoteSpec && PIPE_TOKEN) {
+    // Using remote mode but no explicit remote token: reuse local token.
+    // This happens when wmux auto-exports WMUX_REMOTE but not WMUX_REMOTE_TOKEN.
+  }
 
   const command = args[0];
 

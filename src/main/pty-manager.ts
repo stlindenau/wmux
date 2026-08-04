@@ -1,3 +1,9 @@
+// Parts of this file are created by genAI.
+// This notice needs to remain attached to any reproduction of or excerpt from this file.
+// Agent: Claude Code
+// AI-assisted: Yes
+// See: docs/AGENTS.md for policy and provenance information
+
 import * as pty from 'node-pty';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -301,6 +307,17 @@ export class PtyManager {
       WMUX_PIPE_TOKEN: readPipeToken(),
       WMUX_CLI: cliPath,
     };
+
+    // Auto-export WMUX_REMOTE for devcontainer/remote scenarios (issue #19, #78).
+    // When set, wmux CLI and hooks connect via TCP bridge instead of named pipe.
+    // Uses host.docker.internal (works for Docker Desktop on Windows/WSL2) unless
+    // user overrides via WMUX_BRIDGE_HOST env var before starting wmux.
+    // Falls back gracefully if bridge isn't running (CLI retries with local pipe).
+    if (!env.WMUX_REMOTE) {
+      const bridgeHost = process.env.WMUX_BRIDGE_HOST || 'host.docker.internal';
+      const bridgePort = process.env.WMUX_BRIDGE_PORT || '9787';
+      env.WMUX_REMOTE = `${bridgeHost}:${bridgePort}`;
+    }
 
     // Make bare `wmux` resolvable in every spawned shell AND all its children
     // (Claude Code's Bash tool, hook scripts, the orchestrator coordinator) by
