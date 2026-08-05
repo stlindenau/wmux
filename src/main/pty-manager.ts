@@ -1,9 +1,3 @@
-// Parts of this file are created by genAI.
-// This notice needs to remain attached to any reproduction of or excerpt from this file.
-// Agent: Claude Code
-// AI-assisted: Yes
-// See: docs/AGENTS.md for policy and provenance information
-
 import * as pty from 'node-pty';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -11,6 +5,7 @@ import { execFileSync, spawn } from 'child_process';
 import { v4 as uuidv4 } from 'uuid';
 import { SurfaceId } from '../shared/types';
 import { getPipePath, readPipeToken } from '../shared/instance';
+import { PtyLedger } from './pty-ledger';
 
 // ─── Shell resolution ──────────────────────────────────────────────────────
 // Validates that a shell executable exists before spawning.
@@ -186,9 +181,8 @@ function buildShellArgs(
     // strips every Windows env var, so the notification framework, sidebar and
     // `wmux` CLI inside WSL can't reach the host. /u = pass through, /up = pass
     // through AND translate the Windows path to a WSL mount (/mnt/c/...).
-    // WMUX_REMOTE and WMUX_REMOTE_TOKEN enable TCP bridge mode for devcontainers.
     const wmuxWslEnv =
-      'WMUX/u:WMUX_SURFACE_ID/u:WMUX_CLI/up:WMUX_PIPE/u:WMUX_PIPE_TOKEN/u:WMUX_INTEGRATION/u:WMUX_REMOTE/u:WMUX_REMOTE_TOKEN/u';
+      'WMUX/u:WMUX_SURFACE_ID/u:WMUX_CLI/up:WMUX_PIPE/u:WMUX_PIPE_TOKEN/u:WMUX_INTEGRATION/u';
     env.WSLENV = env.WSLENV ? `${env.WSLENV}:${wmuxWslEnv}` : wmuxWslEnv;
     // A restored WSL/POSIX cwd (issue #60) can't be a Win32 process cwd (error
     // 267). Open it INSIDE the distro via --cd instead; the Win32-side cwd is
@@ -258,6 +252,16 @@ const DA1_REPLY = '\x1b[?62;4;9;22c';
 export class PtyManager {
   private ptys = new Map<SurfaceId, PtyEntry>();
 
+  /**
+   * Optional on-disk record of every PID spawned here, so the next launch can
+   * tree-kill whatever this process left running if it dies without reaching
+   * `killAll()` (issue #139). Optional rather than constructed internally
+   * because tests spawn real PTYs: without an explicit ledger they must not
+   * touch — let alone overwrite — the ledger of the wmux instance the user has
+   * running on the same machine.
+   */
+  constructor(private readonly ledger: PtyLedger | null = null) {}
+
   // ConPTY's input pipe silently drops bytes when a single write outruns the
   // foreground process. Splitting at ~1 KB keeps every chunk well under the
   // pipe buffer; setImmediate between chunks lets ConPTY drain without adding
@@ -308,17 +312,6 @@ export class PtyManager {
       WMUX_PIPE_TOKEN: readPipeToken(),
       WMUX_CLI: cliPath,
     };
-
-    // Auto-export WMUX_REMOTE for devcontainer/remote scenarios (issue #19, #78).
-    // When set, wmux CLI and hooks connect via TCP bridge instead of named pipe.
-    // Uses host.docker.internal (works for Docker Desktop on Windows/WSL2) unless
-    // user overrides via WMUX_BRIDGE_HOST env var before starting wmux.
-    // Falls back gracefully if bridge isn't running (CLI retries with local pipe).
-    if (!env.WMUX_REMOTE) {
-      const bridgeHost = process.env.WMUX_BRIDGE_HOST || 'host.docker.internal';
-      const bridgePort = process.env.WMUX_BRIDGE_PORT || '9787';
-      env.WMUX_REMOTE = `${bridgeHost}:${bridgePort}`;
-    }
 
     // Make bare `wmux` resolvable in every spawned shell AND all its children
     // (Claude Code's Bash tool, hook scripts, the orchestrator coordinator) by
@@ -418,11 +411,18 @@ export class PtyManager {
 
     ptyProcess.onExit(({ exitCode }) => {
       entry.alive = false; // stops any in-flight chunked write
+      if (typeof ptyProcess.pid === 'number') this.ledger?.remove(ptyProcess.pid);
       for (const listener of entry.exitListeners) {
         listener(exitCode);
       }
       this.ptys.delete(id);
     });
+
+    // Recorded after the listeners are attached but before returning, so a
+    // crash between here and the first user keystroke still leaves a trail.
+    if (typeof ptyProcess.pid === 'number' && ptyProcess.pid > 0) {
+      this.ledger?.add(ptyProcess.pid, path.basename(shell));
+    }
 
     this.ptys.set(id, entry);
     return { id, shell, startupCommandsConsumed, reused: false };
@@ -535,6 +535,7 @@ export class PtyManager {
     } catch {
       // Process may already be dead
     }
+    if (typeof pid === 'number') this.ledger?.remove(pid);
     this.ptys.delete(id);
   }
 
@@ -542,6 +543,9 @@ export class PtyManager {
     for (const id of this.ptys.keys()) {
       this.kill(id);
     }
+    // Belt and braces: kill() already dropped each PID, but killAll() is the
+    // shutdown path and the ledger must not outlive it under any partial failure.
+    this.ledger?.clear();
   }
 
   has(id: SurfaceId): boolean {

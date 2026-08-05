@@ -6,6 +6,8 @@ import { IPC_CHANNELS, SurfaceId, WindowId, WorkspaceId, AgentId } from '../shar
 import { observePtyData, clearActivity } from './claude-observer';
 import { clearAgentState } from './agent-state';
 import { PtyManager } from './pty-manager';
+import { PtyLedger, reapOrphans } from './pty-ledger';
+import { getAppDataDir } from '../shared/instance';
 import { NotificationManager } from './notification-manager';
 import { detectShells } from './shell-detector';
 import { listSystemFonts } from './font-detector';
@@ -18,8 +20,10 @@ import { CDPBridge } from './cdp-bridge';
 import { CDPProxy } from './cdp-proxy';
 import { AgentManager } from './agent-manager';
 import { saveNamedSession, loadNamedSession, listNamedSessions, deleteNamedSession, loadSession } from './session-persistence';
-import { sessionWindows, toRestorePayload } from './session-windows';
+import { sessionWindows, toRestorePayload, restoreAnswerFor } from './session-windows';
 import { loadSettings, saveSetting } from './settings-store';
+import { readConsent, updateConsent } from './agent-integration';
+import { handleAgentStateV2 } from './agent-state-rpc';
 import { getChangedFiles, getFileDiff } from './diff-provider';
 import {
   readMarkdownFile,
@@ -30,10 +34,27 @@ import {
 } from './markdown-file';
 import { grantMarkdownPath, isMarkdownPathGranted } from './markdown-grants';
 
-const ptyManager = new PtyManager();
+// Claimed at module load, before anything can spawn a PTY, so the candidate
+// list is strictly what a PREVIOUS instance left behind (issue #139). The
+// killing half is async and driven from index.ts once the app is up.
+const ptyLedger = new PtyLedger(path.join(getAppDataDir(), 'pty-ledger.json'));
+const orphanCandidates = ptyLedger.takeOver();
+
+const ptyManager = new PtyManager(ptyLedger);
 const notificationManager = new NotificationManager();
 const cdpBridge = new CDPBridge();
 const agentManager = new AgentManager(ptyManager);
+
+/**
+ * Tree-kill the PTY subtrees a previously crashed wmux left running (issue
+ * #139). Best-effort and unawaited by design — see reapOrphans().
+ */
+export function reapOrphanedPtys(): void {
+  reapOrphans(orphanCandidates).then(
+    () => { /* reaped, or nothing to reap */ },
+    (err) => { console.warn('[wmux] orphan reap failed:', err?.message); },
+  );
+}
 
 export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstance?: CDPProxy): void {
   // Toggle DevTools for the renderer window
@@ -298,7 +319,11 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
   // could never restore more than one window's worth of state.
   ipcMain.handle(IPC_CHANNELS.SESSION_LOAD_AUTO, (event) => {
     const windowId = windowManager.idForWebContents(event.sender);
-    if (windowId) return toRestorePayload(sessionWindows.get(windowId));
+    if (windowId) {
+      return restoreAnswerFor(sessionWindows.get(windowId), {
+        startup: sessionWindows.isStartup(windowId),
+      });
+    }
     // Unattributable sender: fall back to the file's first window rather than
     // leaving a legitimately-restored window empty.
     return toRestorePayload(loadSession()?.windows?.[0] ?? null);
@@ -312,6 +337,32 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
   ipcMain.on('settings:set', (_event, key: string, value: unknown) => {
     saveSetting(key, value);
   });
+
+  // The #128 back-channel from the sidebar: answer a blocked pane in place.
+  // Routed through the same V2 handler the CLI and pipe clients use, so there
+  // is exactly one implementation of "what does answering mean" — including the
+  // refusals (pane no longer asking, choice already consumed).
+  ipcMain.handle(IPC_CHANNELS.AGENT_ANSWER, (_event, surfaceId: string, choiceId: string) =>
+    new Promise((resolve) => {
+      const handled = handleAgentStateV2(
+        'pane.answer_agent',
+        { surfaceId, choiceId },
+        (result: any) => resolve({ ok: true, ...result }),
+        (_code: number, message: string) => resolve({ ok: false, error: message }),
+      );
+      if (!handled) resolve({ ok: false, error: 'answer_agent not routed' });
+    }),
+  );
+
+  // Agent-integration consent (issue #132). Deliberately NOT routed through the
+  // generic settings:set above: changing this decision has to reconcile the files
+  // in the user's home right away — switching a feature off has to remove what it
+  // wrote, or the toggle would only stop future writes and leave the current ones
+  // in place, which is the original complaint one level down.
+  ipcMain.handle('integration:get', () => readConsent());
+  ipcMain.handle('integration:set', (_event, partial: Parameters<typeof updateConsent>[0]) =>
+    updateConsent(partial ?? {}),
+  );
 
   // OS display-language list for first-launch UI language detection (issue #114).
   // navigator.language follows Chromium's locale resolution, which on Windows can

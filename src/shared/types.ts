@@ -226,6 +226,10 @@ export interface SavedSession {
     cwd: string;
     splitTree: SplitNode;
     browserUrl?: string;
+    // Both written since 0.4x; declared here as of #145, which was caused by a
+    // save path quietly dropping fields the type never mentioned.
+    browserWidth?: number;
+    pinned?: boolean;
   }>;
   sidebarWidth: number;
   // Optional for backward-compat with pre-0.7.6 sessions.
@@ -287,6 +291,7 @@ export const IPC_CHANNELS = {
   NOTIFICATION_CLEAR: 'notification:clear',
   NOTIFICATION_JUMP: 'notification:jump',
   // Settings
+  AGENT_ANSWER: 'agent:answer',
   SETTINGS_GET: 'settings:get',
   SETTINGS_SET: 'settings:set',
   SETTINGS_CHANGED: 'settings:changed',

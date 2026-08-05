@@ -513,4 +513,16 @@ export const fr: Translation = {
   'notificationSound.none': 'Aucun',
   // SplitPane — badge de profil dans le menu nouvel onglet (oubli isolé)
   'surfaceTab.profileBadge': 'projet',
+  // Paramètres — consentement à l'intégration des agents (issue #132)
+  'settings.integration.section': 'Intégration des agents',
+  'settings.integration.enable': 'Autoriser wmux à configurer Claude Code et OpenCode',
+  'settings.integration.hint':
+    "wmux modifie des fichiers dans votre dossier personnel afin que les agents de codage puissent piloter son panneau navigateur, ses vues markdown et l'état de la barre latérale. Désactiver une option ici supprime aussi ce qu'elle avait écrit.",
+  'settings.integration.instructions': 'Instructions pour les agents',
+  'settings.integration.hooks': 'Hooks de statut',
+  'settings.integration.orchestrator': 'Extension orchestrateur',
+  'settings.integration.browserMcp': 'Panneau navigateur pour MCP',
+  // Barre latérale — répondre à un agent bloqué depuis l'extérieur de son panneau (issue #128)
+  'workspaceRow.answerSent': 'Envoyé — en attente…',
+  'workspaceRow.answerTitle': 'Répondre sans basculer vers ce panneau',
 };

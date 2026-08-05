@@ -145,13 +145,6 @@ wmux-orchestrator/
 - **Node.js** -- used by scripts for JSON state manipulation (always available since Claude Code runs on Node.js)
 - **wmux** (optional) -- required for the full multi-pane visual experience; without it, the plugin falls back to native Claude Code subagents
 
-## Running inside a devcontainer
-
-Claude Code sessions inside a Linux devcontainer can't reach wmux's Windows
-named pipe directly. Run `wmux bridge` on the host and set `WMUX_REMOTE`
-(and `WMUX_REMOTE_TOKEN`) in the container to route through it instead --
-see [`docs/DEVCONTAINER.md`](docs/DEVCONTAINER.md) for setup.
-
 ## Links
 
 - **wmux** -- [wmux.org](https://wmux.org)

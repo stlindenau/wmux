@@ -5,7 +5,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 /**
- * wmux hook helper — sends a hook event to wmux.
+ * wmux hook helper — sends a hook event to the wmux pipe.
  * Called by Claude Code hooks (PostToolUse, Notification, Stop, SubagentStop).
  *
  * Usage:
@@ -17,13 +17,6 @@ Object.defineProperty(exports, "__esModule", { value: true });
  *   - PostToolUse Edit/Write → extracts tool_input.file_path
  *   - Notification           → extracts the `message` (what the agent is waiting for)
  * WMUX_SURFACE_ID (set by wmux in each pane's shell) ties the event to its pane.
- *
- * Transport: connects to the named pipe (WMUX_PIPE) by default. When
- * WMUX_REMOTE is set (e.g. running inside a devcontainer that cannot open a
- * Windows named pipe directly, driving a `wmux bridge` on the host instead —
- * issue #78), connects over TCP to that host:port instead, mirroring
- * connectTransport() in wmux.ts. Auth token is the same WMUX_PIPE_TOKEN /
- * WMUX_REMOTE_TOKEN this script already reads either way.
  */
 const net_1 = __importDefault(require("net"));
 const argv = process.argv.slice(2);
@@ -35,28 +28,9 @@ if (argv[0] === '--event') {
 else {
     tool = argv[0] || 'unknown';
 }
-const DEFAULT_BRIDGE_PORT = 9787;
 const pipePath = process.env.WMUX_PIPE || '\\\\.\\pipe\\wmux';
-const token = process.env.WMUX_REMOTE_TOKEN || process.env.WMUX_PIPE_TOKEN || '';
+const token = process.env.WMUX_PIPE_TOKEN || '';
 const surfaceId = process.env.WMUX_SURFACE_ID || '';
-function remoteTarget() {
-    const spec = process.env.WMUX_REMOTE?.trim();
-    if (!spec)
-        return null;
-    const idx = spec.lastIndexOf(':');
-    if (idx === -1)
-        return { host: spec, port: DEFAULT_BRIDGE_PORT };
-    const port = parseInt(spec.slice(idx + 1), 10);
-    return Number.isFinite(port) && port > 0 && port <= 65535
-        ? { host: spec.slice(0, idx) || '127.0.0.1', port }
-        : { host: spec, port: DEFAULT_BRIDGE_PORT };
-}
-function connectTransport(onConnect) {
-    const remote = remoteTarget();
-    return remote
-        ? net_1.default.connect({ host: remote.host, port: remote.port }, onConnect)
-        : net_1.default.connect({ path: pipePath }, onConnect);
-}
 let stdinData = '';
 let sent = false;
 const MAX_STDIN = 64 * 1024; // 64KB cap
@@ -92,12 +66,12 @@ function sendHook() {
         params.message = message;
     if (surfaceId)
         params.surfaceId = surfaceId;
-    const client = connectTransport(() => {
+    const client = net_1.default.connect({ path: pipePath }, () => {
         const msg = JSON.stringify({ method: 'hook.event', params, id: 1, token });
         client.write(msg + '\n', () => client.end());
     });
     client.on('error', () => {
-        // wmux (or the bridge) not reachable — silently ignore.
+        // wmux not running — silently ignore.
         process.exit(0);
     });
 }

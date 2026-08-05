@@ -123,6 +123,12 @@ contextBridge.exposeInMainWorld('wmux', {
       }
     },
   },
+  // What wmux may write into ~/.claude and ~/.config/opencode (issue #132).
+  // Separate from `settings` because setting it has side effects on disk.
+  integration: {
+    get: (): Promise<unknown> => ipcRenderer.invoke('integration:get'),
+    set: (partial: unknown): Promise<unknown> => ipcRenderer.invoke('integration:set', partial),
+  },
   settings: {
     // Synchronous read so the renderer store can hydrate at module-load time.
     getAllSync: (): Record<string, unknown> => {
@@ -185,6 +191,11 @@ contextBridge.exposeInMainWorld('wmux', {
       ipcRenderer.on(IPC_CHANNELS.AGENT_STATE, handler);
       return () => ipcRenderer.removeListener(IPC_CHANNELS.AGENT_STATE, handler);
     },
+    // The back-channel: answer a blocked pane without switching to it. Returns
+    // { ok } — a refusal (the pane stopped asking, the choice is gone) is a
+    // normal outcome the UI reports, not an exception.
+    answer: (surfaceId: string, choiceId: string): Promise<{ ok: boolean; error?: string }> =>
+      ipcRenderer.invoke(IPC_CHANNELS.AGENT_ANSWER, surfaceId, choiceId),
   },
   orchestration: {
     onUpdate: (callback: (state: any) => void) => {
