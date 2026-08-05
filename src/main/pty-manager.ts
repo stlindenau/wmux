@@ -181,8 +181,9 @@ function buildShellArgs(
     // strips every Windows env var, so the notification framework, sidebar and
     // `wmux` CLI inside WSL can't reach the host. /u = pass through, /up = pass
     // through AND translate the Windows path to a WSL mount (/mnt/c/...).
+    // WMUX_REMOTE and WMUX_REMOTE_TOKEN enable TCP bridge mode for devcontainers.
     const wmuxWslEnv =
-      'WMUX/u:WMUX_SURFACE_ID/u:WMUX_CLI/up:WMUX_PIPE/u:WMUX_PIPE_TOKEN/u:WMUX_INTEGRATION/u';
+      'WMUX/u:WMUX_SURFACE_ID/u:WMUX_CLI/up:WMUX_PIPE/u:WMUX_PIPE_TOKEN/u:WMUX_INTEGRATION/u:WMUX_REMOTE/u:WMUX_REMOTE_TOKEN/u';
     env.WSLENV = env.WSLENV ? `${env.WSLENV}:${wmuxWslEnv}` : wmuxWslEnv;
     // A restored WSL/POSIX cwd (issue #60) can't be a Win32 process cwd (error
     // 267). Open it INSIDE the distro via --cd instead; the Win32-side cwd is
@@ -312,6 +313,20 @@ export class PtyManager {
       WMUX_PIPE_TOKEN: readPipeToken(),
       WMUX_CLI: cliPath,
     };
+
+    // Auto-export WMUX_REMOTE for devcontainer/remote scenarios (issue #19, #78).
+    // When set, wmux CLI and hooks connect via TCP bridge instead of named pipe.
+    // Uses host.docker.internal (works for Docker Desktop on Windows/WSL2) unless
+    // user overrides via WMUX_BRIDGE_HOST env var before starting wmux.
+    // Falls back gracefully if bridge isn't running (CLI retries with local pipe).
+    if (!env.WMUX_REMOTE) {
+      const bridgeHost = process.env.WMUX_BRIDGE_HOST || 'host.docker.internal';
+      const bridgePort = process.env.WMUX_BRIDGE_PORT || '9787';
+      env.WMUX_REMOTE = `${bridgeHost}:${bridgePort}`;
+    }
+    if (!env.WMUX_REMOTE_TOKEN) {
+      env.WMUX_REMOTE_TOKEN = readPipeToken();
+    }
 
     // Make bare `wmux` resolvable in every spawned shell AND all its children
     // (Claude Code's Bash tool, hook scripts, the orchestrator coordinator) by

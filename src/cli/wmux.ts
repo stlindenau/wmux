@@ -417,6 +417,21 @@ async function cmdAgentActivity(args: string[]): Promise<void> {
   await sendV2('agent.activity', params);
 }
 
+// Generic V1 passthrough (issue #19: devcontainer support): lets a caller
+// send any raw V1 command line (report_pwd, report_git_branch,
+// report_shell_state, ...) without the CLI needing a dedicated wrapper for
+// each one. wmux-bash-integration.sh's `_wmux_report` sends these lines
+// directly to the local pipe/temp file when running natively; inside a
+// devcontainer (where neither is reachable) it calls `wmux raw-v1` instead,
+// which — like every other command — transparently goes over TCP via
+// --remote/WMUX_REMOTE when a local pipe isn't available (see `wmux bridge`,
+// issue #78).
+async function cmdRawV1(args: string[]): Promise<void> {
+  const line = args.slice(1).join(' ');
+  if (!line) { console.error('Usage: wmux raw-v1 <command> [surfaceId] [args...]'); process.exit(1); }
+  console.log(await sendV1(line));
+}
+
 // ─── Declared agent state (issue #128) ───────────────────────────────────────
 // The reporting side of the protocol. An agent running inside a wmux pane can
 // call these with no arguments beyond the state itself — WMUX_SURFACE_ID is
@@ -932,6 +947,8 @@ const COMMANDS: Record<CommandName, (args: string[]) => Promise<void> | void> = 
   },
   hook: cmdHook,
   'agent-activity': cmdAgentActivity,
+  // Devcontainer support (issue #19)
+  'raw-v1': cmdRawV1,
   ...AGENT_STATE_COMMANDS,
 };
 
