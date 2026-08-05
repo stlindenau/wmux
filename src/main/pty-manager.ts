@@ -311,11 +311,9 @@ export class PtyManager {
 
     // Auto-export WMUX_REMOTE for devcontainer/remote scenarios (issue #19, #78).
     // When set, wmux CLI and hooks connect via TCP bridge instead of named pipe.
-    // Uses host.docker.internal (works for Docker Desktop on Windows/WSL2) unless
-    // user overrides via WMUX_BRIDGE_HOST env var before starting wmux.
-    // Falls back gracefully if bridge isn't running (CLI retries with local pipe).
+    // Uses 127.0.0.1 by default; override via WMUX_BRIDGE_HOST before starting wmux.
     if (!env.WMUX_REMOTE) {
-      const bridgeHost = process.env.WMUX_BRIDGE_HOST || 'host.docker.internal';
+      const bridgeHost = process.env.WMUX_BRIDGE_HOST || '127.0.0.1';
       const bridgePort = process.env.WMUX_BRIDGE_PORT || '9787';
       env.WMUX_REMOTE = `${bridgeHost}:${bridgePort}`;
     }
