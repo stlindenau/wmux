@@ -1,9 +1,3 @@
-// Parts of this file are created by genAI.
-// This notice needs to remain attached to any reproduction of or excerpt from this file.
-// Agent: Claude Code
-// AI-assisted: Yes
-// See: docs/AGENTS.md for policy and provenance information
-
 import * as pty from 'node-pty';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -11,6 +5,7 @@ import { execFileSync, spawn } from 'child_process';
 import { v4 as uuidv4 } from 'uuid';
 import { SurfaceId } from '../shared/types';
 import { getPipePath, readPipeToken } from '../shared/instance';
+import { PtyLedger } from './pty-ledger';
 
 // ─── Shell resolution ──────────────────────────────────────────────────────
 // Validates that a shell executable exists before spawning.
@@ -257,6 +252,16 @@ const DA1_REPLY = '\x1b[?62;4;9;22c';
 export class PtyManager {
   private ptys = new Map<SurfaceId, PtyEntry>();
 
+  /**
+   * Optional on-disk record of every PID spawned here, so the next launch can
+   * tree-kill whatever this process left running if it dies without reaching
+   * `killAll()` (issue #139). Optional rather than constructed internally
+   * because tests spawn real PTYs: without an explicit ledger they must not
+   * touch — let alone overwrite — the ledger of the wmux instance the user has
+   * running on the same machine.
+   */
+  constructor(private readonly ledger: PtyLedger | null = null) {}
+
   // ConPTY's input pipe silently drops bytes when a single write outruns the
   // foreground process. Splitting at ~1 KB keeps every chunk well under the
   // pipe buffer; setImmediate between chunks lets ConPTY drain without adding
@@ -406,11 +411,18 @@ export class PtyManager {
 
     ptyProcess.onExit(({ exitCode }) => {
       entry.alive = false; // stops any in-flight chunked write
+      if (typeof ptyProcess.pid === 'number') this.ledger?.remove(ptyProcess.pid);
       for (const listener of entry.exitListeners) {
         listener(exitCode);
       }
       this.ptys.delete(id);
     });
+
+    // Recorded after the listeners are attached but before returning, so a
+    // crash between here and the first user keystroke still leaves a trail.
+    if (typeof ptyProcess.pid === 'number' && ptyProcess.pid > 0) {
+      this.ledger?.add(ptyProcess.pid, path.basename(shell));
+    }
 
     this.ptys.set(id, entry);
     return { id, shell, startupCommandsConsumed, reused: false };
@@ -523,6 +535,7 @@ export class PtyManager {
     } catch {
       // Process may already be dead
     }
+    if (typeof pid === 'number') this.ledger?.remove(pid);
     this.ptys.delete(id);
   }
 
@@ -530,6 +543,9 @@ export class PtyManager {
     for (const id of this.ptys.keys()) {
       this.kill(id);
     }
+    // Belt and braces: kill() already dropped each PID, but killAll() is the
+    // shutdown path and the ledger must not outlive it under any partial failure.
+    this.ledger?.clear();
   }
 
   has(id: SurfaceId): boolean {

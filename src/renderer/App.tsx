@@ -3,9 +3,10 @@ import { v4 as uuid } from 'uuid';
 import { useStore } from './store';
 import { PaneId, SurfaceId, WorkspaceId, WorkspaceInfo, SplitNode } from '../shared/types';
 import SplitContainer from './components/SplitPane/SplitContainer';
-import { updateRatio, getAllPaneIds, findLeaf, replaceSoleTerminalSurface } from './store/split-utils';
+import { updateRatio, getAllPaneIds, findLeaf, replaceSoleTerminalSurface, freezeSurfaceCwds } from './store/split-utils';
 import { DEFAULT_DEV_PORTS, mergeDevPorts, matchDevPorts, firstNewDevPort } from './dev-ports';
 import { aggregateProgress } from './store/progress-slice';
+import { isDiffTabDismissed } from './store/surface-slice';
 import Sidebar from './components/Sidebar/Sidebar';
 import Titlebar from './components/Titlebar/Titlebar';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
@@ -18,6 +19,7 @@ import BrowserPane from './components/Browser/BrowserPane';
 import Tutorial from './components/Tutorial/Tutorial';
 import SplitPreviewOverlay from './components/SplitPane/SplitPreviewOverlay';
 import { initPipeBridge } from './pipe-bridge';
+import { setKeyRemaps } from './key-remaps';
 import { useUiTheme } from './hooks/useUiTheme';
 import { useUiMode } from './hooks/useUiMode';
 import type {
@@ -106,6 +108,57 @@ type MetaDeps = {
   t: T;
 };
 
+type SetWidth = (width: number) => void;
+
+/**
+ * Rehydrate from the rolling auto-save (the file main writes every 30s + on quit).
+ *
+ * `'fresh'` is main saying "this window was opened during the run — come up
+ * empty". It is distinct from `'none'` ("nothing saved for you") precisely
+ * because the caller must NOT fall through to a named session in that case:
+ * doing so cloned the session's workspace, pane and surface ids into a second
+ * window, and PTY id is surface id, so the clone re-attached to live PTYs and
+ * every id-based CLI lookup had two equally valid answers (issue #143).
+ */
+async function restoreAutoSaved(t: T, setWidth: SetWidth): Promise<'restored' | 'fresh' | 'none'> {
+  try {
+    const autoSaved = await window.wmux?.session?.loadAuto?.();
+    if (autoSaved && Array.isArray(autoSaved.workspaces) && autoSaved.workspaces.length > 0) {
+      useStore.getState().replaceAllWorkspaces(autoSaved.workspaces, autoSaved.activeIndex, t);
+      if (autoSaved.sidebarWidth) setWidth(autoSaved.sidebarWidth);
+      return 'restored';
+    }
+    return (autoSaved as { fresh?: boolean } | null | undefined)?.fresh ? 'fresh' : 'none';
+  } catch {
+    return 'none';
+  }
+}
+
+/**
+ * Fall back to the most recent manually-saved session. Returns whether it
+ * restored one.
+ *
+ * This is also the post-update path (the version change clears the auto-session
+ * and leaves an "Auto-backup vX" named session behind), so it has to restore
+ * exactly what the Sessions menu's Load does — including terminalPrefs, which
+ * it used to skip (issue #145).
+ */
+async function restoreNamedSession(t: T, setWidth: SetWidth): Promise<boolean> {
+  try {
+    const sessions = await window.wmux?.session?.list();
+    const name = sessions?.[0]?.name;
+    if (!name) return false;
+    const session = await window.wmux?.session?.load(name);
+    if (!session) return false;
+    useStore.getState().replaceAllWorkspaces(session.workspaces, undefined, t);
+    if (session.sidebarWidth) setWidth(session.sidebarWidth);
+    if (session.terminalPrefs) useStore.getState().setTerminalPrefs(session.terminalPrefs);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function fireNotification(
   surfaceId: string,
   workspaceId: WorkspaceId | null,
@@ -157,12 +210,16 @@ function markSessionIdleOnStop(
 function maybeAutoOpenDiffTab(tool: string, ownerWs: WorkspaceInfo): void {
   const state = useStore.getState();
   if ((tool !== 'Edit' && tool !== 'Write') || !state.workspacePrefs.autoOpenDiffTab) return;
+  // A diff tab the user closed stays closed (issue #141). Without this, every
+  // Edit/Write put it back minutes later with no user action — and on a large
+  // repo its polling is what made typing lag, so "close it" was not a fix.
+  if (isDiffTabDismissed(ownerWs.id)) return;
   const bottomPaneId = findBottomPane(ownerWs.splitTree);
   if (!bottomPaneId) return;
   const bottomLeaf = findLeafFromTree(ownerWs.splitTree, bottomPaneId);
   // Only add diff tab if bottom pane doesn't already have one
   if (bottomLeaf && !bottomLeaf.surfaces.some(s => s.type === 'diff')) {
-    state.addSurface(ownerWs.id, bottomPaneId, 'diff');
+    state.addSurface(ownerWs.id, bottomPaneId, 'diff', { auto: true });
   }
 }
 
@@ -465,28 +522,12 @@ export default function App() {
   // restart users with no manually-saved snapshot lost their workspaces.
   useEffect(() => {
     (async () => {
-      try {
-        const autoSaved = await window.wmux?.session?.loadAuto?.();
-        if (autoSaved && Array.isArray(autoSaved.workspaces) && autoSaved.workspaces.length > 0) {
-          const { replaceAllWorkspaces } = useStore.getState();
-          replaceAllWorkspaces(autoSaved.workspaces, autoSaved.activeIndex, t);
-          if (autoSaved.sidebarWidth) setSidebarWidth(autoSaved.sidebarWidth);
-          return;
-        }
-      } catch {}
-      try {
-        const sessions = await window.wmux?.session?.list();
-        if (sessions && sessions.length > 0) {
-          const session = await window.wmux?.session?.load(sessions[0].name);
-          if (session) {
-            const { replaceAllWorkspaces } = useStore.getState();
-            replaceAllWorkspaces(session.workspaces, undefined, t);
-            if (session.sidebarWidth) setSidebarWidth(session.sidebarWidth);
-            return;
-          }
-        }
-      } catch {}
-      // No saved session — create default workspace
+      const outcome = await restoreAutoSaved(t, setSidebarWidth);
+      if (outcome === 'restored') return;
+      // 'fresh' means main deliberately wants this window empty — a named
+      // session must not be cloned into it (issue #143).
+      if (outcome !== 'fresh' && await restoreNamedSession(t, setSidebarWidth)) return;
+      // Nothing to restore — create the default workspace.
       if (useStore.getState().workspaces.length === 0) {
         createWorkspace({
           title: t('app.firstSessionTitle', 'Session 1'),
@@ -527,6 +568,9 @@ export default function App() {
       const state = useStore.getState();
       applyUserConfigTerminal(state, result?.terminal);
       applyUserConfigBrowser(result?.browser);
+      // `[keys]` remaps (issue #146) — main has already parsed and validated
+      // them, so this is a straight hand-off to the terminal key handler.
+      setKeyRemaps(result?.keys);
 
       // App UI theme override (issue #67): `[appearance] ui-theme = "..."`.
       const uiTheme = result?.appearance?.uiTheme;
@@ -710,7 +754,10 @@ export default function App() {
             pinned: ws.pinned,
             shell: ws.shell,
             cwd: ws.cwd, // issue #20 — restore so new terminals reopen in the workspace folder
-            splitTree: ws.splitTree,
+            // Per-tab directories, frozen at save time (issue #134): ws.cwd above
+            // is a single value for the whole workspace, so on its own it sends
+            // every restored terminal to the same place.
+            splitTree: freezeSurfaceCwds(ws.splitTree),
             browserUrl: ws.browserUrl,
             browserWidth: ws.browserWidth,
           })),
@@ -769,9 +816,15 @@ export default function App() {
       workspaces: state.workspaces.map(ws => ({
         title: ws.title,
         customColor: ws.customColor,
+        // Pinning is part of the layout the user arranged — the auto-save has
+        // always kept it, so a named save must too (issue #145).
+        pinned: ws.pinned,
         shell: ws.shell,
         cwd: ws.cwd || '',
-        splitTree: ws.splitTree,
+        // See the auto-save path below — a named session is the case #134
+        // reported, where losing a worktree's drive makes the session
+        // unidentifiable after a restore.
+        splitTree: freezeSurfaceCwds(ws.splitTree),
         browserUrl: ws.browserUrl || '',
         browserWidth: ws.browserWidth,
       })),

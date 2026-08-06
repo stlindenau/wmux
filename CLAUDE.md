@@ -60,9 +60,10 @@ docs/             Planning docs
 | `agent-manager.ts` | Agent PTY spawning, round-robin distribution across panes |
 | `window-manager.ts` | Electron BrowserWindow creation/management |
 | `ipc-handlers.ts` | All IPC channel handlers |
-| `claude-context.ts` | Auto-injects wmux instructions into `~/.claude/CLAUDE.md`, configures hooks, installs wmux-orchestrator plugin |
+| `claude-context.ts` | Injects wmux instructions into `~/.claude/CLAUDE.md`, configures hooks, installs wmux-orchestrator plugin — **and the inverse of each**, since 0.40.0 |
+| `agent-integration.ts` | Consent gate for every write outside `%APPDATA%\wmux` (issue #132). Asks on first launch, stores `unset`/`granted`/`declined` in wmux's own settings.json, and reconciles `~/.claude` + `~/.config/opencode` to match. Nothing in `claude-context.ts` or `opencode-context.ts` may be called directly from startup any more — route it through here |
 | `claude-observer.ts` | Monitors Claude Code activity for sidebar display |
-| `agent-state.ts` | Declared agent run state — blocked/working/idle, run refcount, `seq` dedupe, metadata TTL (issue #128) |
+| `agent-state.ts` | Declared agent run state — blocked/working/idle, run refcount, `seq` dedupe, metadata TTL (issue #128). Also the back-channel: declared `choices` + `answerAgent`. **Answering never clears `blocked`** — the agent must confirm, or a mis-declared key silently stops a stuck pane asking for help |
 | `agent-state-rpc.ts` | `pane.report_agent` & friends, routed off the main V2 switch |
 | `agent-hook-bridge.ts` | Claude Code hooks → declared state, so it works with no plugin to install |
 | `session-persistence.ts` | Auto-save/restore window state |
@@ -321,13 +322,14 @@ The pipe server in `index.ts` handles V2 JSON-RPC methods. Most delegate to the 
 - `browser.*` (via CDP bridge)
 - `agent.spawn`, `agent.spawn_batch`, `agent.status`, `agent.list`, `agent.kill`
 - `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.release_agent`, `pane.agent_state`
+- `pane.answer_agent` — the back-channel (issue #128). The only non-`report_*` method: it WRITES into a pane's PTY. Guarded — refuses unless the pane is currently `blocked`, and only ever sends a payload the agent itself declared
 - `hook.event`, `diff.refresh`
 
 ---
 
 ## wmux-orchestrator Plugin
 
-Claude Code plugin bundled in `resources/wmux-orchestrator/`. Auto-installed into `~/.claude/plugins/cache/` on startup by `ensureOrchestratorPlugin()` in `claude-context.ts`. Also published standalone: `github.com/amirlehmam/wmux-orchestrator`.
+Claude Code plugin bundled in `resources/wmux-orchestrator/`. Installed into `~/.claude/plugins/cache/` on startup by `ensureOrchestratorPlugin()` in `claude-context.ts` — but only when the user has granted the `orchestrator` feature (issue #132); `agent-integration.ts` owns that call. Also published standalone: `github.com/amirlehmam/wmux-orchestrator`.
 
 **What it does:** Decomposes complex dev tasks into parallel Claude Code agents coordinated through dependency-aware waves with automated review. With wmux: each agent in its own visible terminal pane. Without wmux: falls back to native subagents.
 
@@ -350,8 +352,6 @@ resources/wmux-orchestrator/
 ```
 
 **Key design:** Skills handle intelligence (prompts), hooks handle reactivity (events), scripts handle wmux operations (CLI). State shared via JSON file in TMPDIR. No daemon.
-
-**Devcontainer transport (issue #19):** Claude Code sessions inside a Linux devcontainer can't open a Windows named pipe, so they drive wmux through its existing TCP remote-management support instead (`wmux bridge` + `--remote`/`WMUX_REMOTE`, issue #78) — no new server or protocol. `wmux-resolve.sh`'s `wmux()` shim already works over this transport unmodified; `src/cli/wmux-hook.ts` connects via TCP directly when `WMUX_REMOTE` is set (mirroring `connectTransport()` in `wmux.ts`); `src/shell-integration/wmux-bash-integration.sh` calls the new `wmux raw-v1 <line>` CLI command instead of writing to the native WSL temp-file path. See `resources/wmux-orchestrator/docs/DEVCONTAINER.md`.
 
 ---
 
@@ -396,6 +396,8 @@ wmux browser back | forward | reload
 # Declared agent state (issue #128) — blocked / working / idle, no screen scraping.
 # Surface defaults to $WMUX_SURFACE_ID, so an agent inside a pane needs no id.
 wmux report-agent --blocked "permission: Bash"   # parked on a human
+wmux report-agent --blocked "Run it?" --choices '[{"id":"y","label":"Yes","key":"1"}]'
+wmux answer-agent --surface <id> --choice y      # reply to ANOTHER pane, from yours
 wmux report-agent --unblocked                    # the human answered
 wmux report-agent --run-start | --run-end        # refcount, so nested subagents nest
 wmux report-agent --run-depth N [--seq N]        # absolute depth; --seq drops replays
@@ -415,9 +417,6 @@ wmux log <level> <message> | sidebar-state
 
 # Hooks
 wmux hook --event <type> --tool <name> [--agent <id>]
-
-# Devcontainer support (issue #19)
-wmux raw-v1 <command> [surfaceId] [args...]   # send a raw V1 pipe command (works over --remote too)
 ```
 
 ---

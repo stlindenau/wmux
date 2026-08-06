@@ -1,5 +1,5 @@
 import { app, BrowserWindow, ipcMain, shell } from 'electron';
-import { registerIpcHandlers, agentManager, ptyManager, setupAgentPtyForwarding } from './ipc-handlers';
+import { registerIpcHandlers, agentManager, ptyManager, setupAgentPtyForwarding, reapOrphanedPtys } from './ipc-handlers';
 import { handleBrowserV2 } from './v2-browser';
 import { handleBridgeV2 } from './v2-bridge';
 import { distributeAgents } from './agent-manager';
@@ -13,10 +13,9 @@ import { sessionWindows, MAX_RESTORED_WINDOWS } from './session-windows';
 import { WindowManager } from './window-manager';
 import { initAutoUpdater, requestUpdateNow, getUpdateState } from './updater';
 import { initUpdateChecker, getLatestUpdate } from './update-checker';
-import { ensureClaudeContext, ensureClaudeHooks, ensureChromeDevtoolsConfig, ensureOrchestratorPlugin } from './claude-context';
-import { ensureOpencodeContext, ensureOpencodePlugin } from './opencode-context';
+import { initAgentIntegration } from './agent-integration';
 import { applyExternalActivity, markSubagentStop, markAllAgentsDone } from './claude-observer';
-import { handleAgentStateV2 } from './agent-state-rpc';
+import { handleAgentStateV2, setAnswerWriter } from './agent-state-rpc';
 import { applyHookToAgentState } from './agent-hook-bridge';
 import { startOrchestrationWatcher } from './orchestration-watcher';
 import { readMarkdownFile } from './markdown-file';
@@ -267,6 +266,32 @@ function translateKeyName(key: string, shift: boolean): string | null {
   return null;
 }
 
+/**
+ * Deliver an answer from `pane.answer_agent` into the pane (issue #128).
+ *
+ * Wired here rather than in agent-state-rpc.ts because this is where both
+ * halves already live: the PTY manager, and the named-key table that
+ * `surface.send_key` uses. Sharing that table is the point — a choice declaring
+ * `key: "enter"` must reach the terminal as exactly the same bytes it would if
+ * the user had asked wmux to send that key by hand, or the back-channel becomes
+ * a second, subtly different way to type.
+ *
+ * An unknown key name throws rather than falling back to writing the name as
+ * literal text: silently typing "enter" into a permission prompt would answer
+ * the wrong thing.
+ */
+setAnswerWriter(async (surfaceId, payload) => {
+  const resolved = await resolvePtySurface(surfaceId);
+  if (!resolved.ok) throw new Error(resolved.error);
+  if (payload.key !== undefined) {
+    const translated = translateKeyName(payload.key, false);
+    if (translated === null) throw new Error(`the agent declared an unknown key name: "${payload.key}"`);
+    ptyManager.write(resolved.id, translated);
+    return;
+  }
+  ptyManager.write(resolved.id, payload.text ?? '');
+});
+
 // Set Windows AppUserModelId so taskbar pinning uses the correct icon & identity
 app.setAppUserModelId('com.wmux.app');
 
@@ -416,13 +441,6 @@ app.whenReady().then(() => {
   // A losing second instance is already quitting; don't run startup side effects.
   if (!gotInstanceLock) return;
   hardenWebContents();
-  // Inject wmux instructions into ~/.claude/CLAUDE.md for Claude Code awareness
-  ensureClaudeContext();
-  ensureClaudeHooks();
-  ensureChromeDevtoolsConfig();
-  ensureOrchestratorPlugin();
-  ensureOpencodeContext();
-  ensureOpencodePlugin();
 
   // IPC: renderer pushes session state (auto-save response or explicit save).
   // Every window answers the same broadcast, each with a one-entry `windows`
@@ -460,6 +478,18 @@ app.whenReady().then(() => {
 
   registerIpcHandlers(windowManager, cdpProxy);
 
+  // Tree-kill whatever a previously CRASHED instance left running (issue #139).
+  // `will-quit` — the only thing that calls killAll() — does not run on a crash,
+  // and Windows does not tear down a process tree when its root dies, so every
+  // pane's shell, its agent and that agent's MCP servers survive. Restoring the
+  // session below then spawns a fresh set beside them, so without this a
+  // crash-loop multiplies processes instead of replacing them.
+  //
+  // Runs before the restore for tidiness only: the orphans are unrelated to the
+  // PTYs about to be created, and the reap itself is async and unawaited so
+  // startup never blocks on it.
+  reapOrphanedPtys();
+
   // Clear stale session data on version change (clean start for upgrades/fresh installs)
   handleVersionChange(app.getVersion());
 
@@ -467,16 +497,32 @@ app.whenReady().then(() => {
   // Each gets its own slot in the registry so its renderer restores its own
   // workspaces — `SESSION_LOAD_AUTO` used to hand windows[0] to whoever asked,
   // which made a second window a clone of the first.
+  //
+  // These are also the only windows allowed to fall back to the newest *named*
+  // session when they have no slot: a window opened later in the run must come
+  // up empty instead of cloning one, which would duplicate its surface ids —
+  // and PTY id is surface id, so the clone would attach to live PTYs (#143).
   const savedSession = loadSession();
   const savedWindows = (savedSession?.windows ?? []).slice(0, MAX_RESTORED_WINDOWS);
   if (savedWindows.length === 0) {
-    windowManager.createWindow();
+    sessionWindows.markStartup(windowManager.createWindow());
   } else {
     for (const saved of savedWindows) {
       const id = windowManager.createWindow(saved.bounds, saved.maximized);
       sessionWindows.prime(id, saved);
+      sessionWindows.markStartup(id);
     }
   }
+
+  // Everything wmux writes into ~/.claude and ~/.config/opencode now runs behind
+  // a stored consent decision, and asks for one on first launch (issue #132).
+  //
+  // Placed AFTER the windows exist, for two reasons. The prompt is a modal
+  // dialog, and an ownerless one opens with nothing behind it — a question about
+  // an app the user cannot yet see. And it is deliberately not awaited: startup
+  // must not block on an answer, so the rest of the launch proceeds and the
+  // integration lands whenever the user gets to it.
+  void initAgentIntegration(BrowserWindow.getAllWindows()[0]);
 
   // Cold launch from the Explorer verb: no instance was running, so there is no
   // second-instance event — the folder is in our own argv. Wait for the renderer
