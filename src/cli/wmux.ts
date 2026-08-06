@@ -657,6 +657,10 @@ const COMMAND_SPECS = {
     value: ['--lines', '--surface'],
   },
   'trigger-flash': { usage: 'wmux trigger-flash [surfaceId]' },
+  'raw-v1': {
+    usage: 'wmux raw-v1 <command> [surfaceId] [args...]',
+    passthrough: true,
+  },
 
   // Browser (free-form text for type/fill/eval)
   browser: {
