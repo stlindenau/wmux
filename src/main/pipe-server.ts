@@ -159,6 +159,13 @@ export class PipeServer extends EventEmitter {
           } catch {}
           setTimeout(() => this.startUnixSocket(connectionHandler), 500);
         }
+      } else {
+        // Log other errors for debugging
+        console.error(`[wmux] Unix socket error (${err.code || 'unknown'}):`, err.message);
+        if (process.platform === 'win32' && (err.code === 'ENOTSUP' || err.code === 'ENOENT' || err.message.includes('not supported'))) {
+          console.warn('[wmux] Unix sockets may not be supported on this Windows version (requires Windows 10 build 17063+)');
+          console.warn('[wmux] WSL bridge will not be available, but local named pipe still works');
+        }
       }
     });
   }
