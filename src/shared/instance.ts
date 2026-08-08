@@ -40,14 +40,15 @@ export function getPipePath(): string {
 
 /**
  * Returns the Unix socket path for cross-platform Unix socket support.
- * On Windows: Creates socket in TEMP directory (accessible from WSL via /mnt/c/...)
+ * On Windows: Creates socket in APPDATA directory (same as token, WSL accessible via /mnt/c/...)
  * On Linux/WSL: Uses XDG_RUNTIME_DIR or /tmp
  */
 export function getUnixSocketPath(): string {
   if (getPlatformType() === 'windows') {
-    // Windows: Use TEMP directory which WSL can access
-    const tempDir = process.env.TEMP || path.join(os.homedir(), 'AppData', 'Local', 'Temp');
-    return path.join(tempDir, `wmux${suffix()}.sock`);
+    // Windows: Use APPDATA directory (same location as token)
+    // This avoids permission issues in TEMP and is accessible from WSL
+    const appData = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+    return path.join(appData, `wmux${suffix()}`, 'wmux.sock');
   } else {
     // Linux/WSL: Standard Unix socket path
     const runtimeDir = process.env.XDG_RUNTIME_DIR || '/tmp';
