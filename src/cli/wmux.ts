@@ -4,10 +4,11 @@ import net from 'net';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { getPipePath, getPipeTokenPath } from '../shared/instance';
 
 // Respect WMUX_PIPE when set (e.g. by a parent wmux running with WMUX_INSTANCE),
 // so the CLI talks to the same instance that spawned the shell.
-const PIPE_PATH = process.env.WMUX_PIPE || '\\\\.\\pipe\\wmux';
+const PIPE_PATH = process.env.WMUX_PIPE || getPipePath();
 
 // ─── Remote transport (issue #78: remote wmux management) ────────────────────
 // When --remote host[:port] (or WMUX_REMOTE) is set, every command connects
@@ -30,21 +31,27 @@ function parseRemoteTarget(spec: string): { host: string; port: number } {
 }
 
 function connectTransport(onConnect: () => void): net.Socket {
-  return remoteTarget
-    ? net.connect({ host: remoteTarget.host, port: remoteTarget.port }, onConnect)
-    : net.connect({ path: PIPE_PATH }, onConnect);
+  // Connection priority:
+  // 1. TCP remote (--remote or WMUX_REMOTE)
+  // 2. Unix socket override (WMUX_UNIX_SOCKET - for WSL bridge)
+  // 3. Default platform path (WMUX_PIPE or getPipePath())
+  if (remoteTarget) {
+    return net.connect({ host: remoteTarget.host, port: remoteTarget.port }, onConnect);
+  } else if (process.env.WMUX_UNIX_SOCKET) {
+    return net.connect({ path: process.env.WMUX_UNIX_SOCKET }, onConnect);
+  } else {
+    return net.connect({ path: PIPE_PATH }, onConnect);
+  }
 }
 
 // Auth token for privileged (V2) pipe requests. wmux injects WMUX_PIPE_TOKEN
 // into the shells it spawns; for CLIs launched elsewhere, fall back to the
-// token file in the instance's APPDATA dir (readable only by this user).
+// token file in the instance's APPDATA/config dir (readable only by this user).
 function readPipeToken(): string {
   const fromEnv = process.env.WMUX_PIPE_TOKEN?.trim();
   if (fromEnv) return fromEnv;
   try {
-    const suffix = process.env.WMUX_INSTANCE?.trim() ? `-${process.env.WMUX_INSTANCE.trim()}` : '';
-    const base = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
-    return fs.readFileSync(path.join(base, `wmux${suffix}`, 'pipe-token'), 'utf-8').trim();
+    return fs.readFileSync(getPipeTokenPath(), 'utf-8').trim();
   } catch {
     return '';
   }

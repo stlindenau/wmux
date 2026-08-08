@@ -16,13 +16,59 @@ function suffix(): string {
   return name ? `-${name}` : '';
 }
 
-export function getPipePath(): string {
-  return `\\\\.\\pipe\\wmux${suffix()}`;
+/**
+ * Returns the platform type for socket path resolution.
+ */
+function getPlatformType(): 'windows' | 'unix' {
+  return process.platform === 'win32' ? 'windows' : 'unix';
 }
 
+/**
+ * Returns the default IPC path for the current platform.
+ * Windows: Named pipe (\\.\pipe\wmux)
+ * Linux/WSL: Unix socket (XDG_RUNTIME_DIR/wmux.sock or /tmp/wmux.sock)
+ */
+export function getPipePath(): string {
+  if (getPlatformType() === 'windows') {
+    return `\\\\.\\pipe\\wmux${suffix()}`;
+  } else {
+    // Unix: Use XDG_RUNTIME_DIR or fall back to /tmp
+    const runtimeDir = process.env.XDG_RUNTIME_DIR || '/tmp';
+    return path.join(runtimeDir, `wmux${suffix()}.sock`);
+  }
+}
+
+/**
+ * Returns the Unix socket path for cross-platform Unix socket support.
+ * On Windows: Creates socket in TEMP directory (accessible from WSL via /mnt/c/...)
+ * On Linux/WSL: Uses XDG_RUNTIME_DIR or /tmp
+ */
+export function getUnixSocketPath(): string {
+  if (getPlatformType() === 'windows') {
+    // Windows: Use TEMP directory which WSL can access
+    const tempDir = process.env.TEMP || path.join(os.homedir(), 'AppData', 'Local', 'Temp');
+    return path.join(tempDir, `wmux${suffix()}.sock`);
+  } else {
+    // Linux/WSL: Standard Unix socket path
+    const runtimeDir = process.env.XDG_RUNTIME_DIR || '/tmp';
+    return path.join(runtimeDir, `wmux${suffix()}.sock`);
+  }
+}
+
+/**
+ * Returns the application data directory following platform conventions.
+ * Windows: %APPDATA%\wmux or %USERPROFILE%\AppData\Roaming\wmux
+ * Linux/Unix: $XDG_CONFIG_HOME/wmux or ~/.config/wmux
+ */
 export function getAppDataDir(): string {
-  const base = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
-  return path.join(base, `wmux${suffix()}`);
+  if (getPlatformType() === 'windows') {
+    const base = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+    return path.join(base, `wmux${suffix()}`);
+  } else {
+    // Unix: Follow XDG Base Directory specification
+    const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
+    return path.join(configHome, `wmux${suffix()}`);
+  }
 }
 
 /**
