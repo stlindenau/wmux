@@ -114,6 +114,16 @@ export class PipeServer extends EventEmitter {
   }
 
   private startUnixSocket(connectionHandler: (socket: net.Socket) => void): void {
+    // Ensure parent directory exists (especially on Windows where socket goes in AppData/wmux/)
+    const socketDir = require('path').dirname(this.unixSocketPath);
+    try {
+      fs.mkdirSync(socketDir, { recursive: true });
+    } catch (err: any) {
+      if (err.code !== 'EEXIST') {
+        console.warn(`[wmux] Could not create socket directory: ${err.message}`);
+      }
+    }
+
     // Clean up stale socket file before binding
     if (process.platform !== 'win32') {
       try {
