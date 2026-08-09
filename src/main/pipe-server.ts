@@ -1,7 +1,6 @@
 import net from 'net';
-import fs from 'fs';
 import { EventEmitter } from 'events';
-import { tokensMatch, getUnixSocketPath } from '../shared/instance';
+import { tokensMatch } from '../shared/instance';
 
 export interface V1Command {
   command: string;
@@ -37,22 +36,18 @@ export interface V2Response {
 }
 
 export class PipeServer extends EventEmitter {
-  private pipeServer: net.Server | null = null;  // Windows named pipe
-  private unixServer: net.Server | null = null;  // Unix socket (all platforms)
+  private server: net.Server | null = null;
   private pipePath: string;
-  private unixSocketPath: string;
   private authToken: string;
 
   constructor(pipePath = '\\\\.\\pipe\\wmux', authToken = '') {
     super();
     this.pipePath = pipePath;
-    this.unixSocketPath = getUnixSocketPath();
     this.authToken = authToken;
   }
 
   start(): void {
-    // Shared connection handler for both transports (V1/V2 protocol is transport-agnostic)
-    const connectionHandler = (socket: net.Socket) => {
+    this.server = net.createServer((socket) => {
       let buffer = '';
 
       socket.on('data', (data) => {
@@ -84,117 +79,28 @@ export class PipeServer extends EventEmitter {
       socket.on('error', () => {
         // Client disconnected, ignore
       });
-    };
-
-    // Windows: Start both named pipe AND Unix socket servers
-    if (process.platform === 'win32') {
-      // Named pipe server (existing behavior for local Windows shells)
-      this.pipeServer = net.createServer(connectionHandler);
-      this.pipeServer.listen(this.pipePath, () => {
-        console.log(`[wmux] Listening on named pipe: ${this.pipePath}`);
-      });
-
-      this.pipeServer.on('error', (err: NodeJS.ErrnoException) => {
-        if (err.code === 'EADDRINUSE') {
-          // Pipe already exists, try to clean up and retry
-          net.connect({ path: this.pipePath }, () => {}).on('error', () => {
-            // No one is listening, safe to retry
-            this.pipeServer?.close();
-            setTimeout(() => this.start(), 500);
-          });
-        }
-      });
-
-      // Unix socket server (NEW - for WSL bridge access)
-      this.startUnixSocket(connectionHandler);
-    } else {
-      // Linux/WSL: Unix socket only
-      this.startUnixSocket(connectionHandler);
-    }
-  }
-
-  private startUnixSocket(connectionHandler: (socket: net.Socket) => void): void {
-    // Ensure parent directory exists (especially on Windows where socket goes in AppData/wmux/)
-    const socketDir = require('path').dirname(this.unixSocketPath);
-    try {
-      fs.mkdirSync(socketDir, { recursive: true });
-    } catch (err: any) {
-      if (err.code !== 'EEXIST') {
-        console.warn(`[wmux] Could not create socket directory: ${err.message}`);
-      }
-    }
-
-    // Clean up stale socket file before binding
-    if (process.platform !== 'win32') {
-      try {
-        fs.unlinkSync(this.unixSocketPath);
-      } catch (err: any) {
-        if (err.code !== 'ENOENT') {
-          console.warn(`[wmux] Could not remove stale socket: ${err.message}`);
-        }
-      }
-    }
-
-    this.unixServer = net.createServer(connectionHandler);
-    this.unixServer.listen(this.unixSocketPath, () => {
-      console.log(`[wmux] Listening on Unix socket: ${this.unixSocketPath}`);
-      if (process.platform === 'win32') {
-        console.log('[wmux] WSL can access this socket via /mnt/c/Users/.../Temp/wmux.sock');
-      }
-
-      // Set socket file permissions on Unix
-      if (process.platform !== 'win32') {
-        try {
-          fs.chmodSync(this.unixSocketPath, 0o600);
-        } catch (err) {
-          console.warn(`[wmux] Could not set socket permissions: ${err}`);
-        }
-      }
     });
 
-    this.unixServer.on('error', (err: NodeJS.ErrnoException) => {
+    this.server.listen(this.pipePath, () => {
+      console.log(`wmux pipe server listening on ${this.pipePath}`);
+    });
+
+    this.server.on('error', (err: NodeJS.ErrnoException) => {
       if (err.code === 'EADDRINUSE') {
-        if (process.platform === 'win32') {
-          // Windows: retry logic (socket may exist but no listener)
-          net.connect({ path: this.unixSocketPath }, () => {}).on('error', () => {
-            this.unixServer?.close();
-            setTimeout(() => this.startUnixSocket(connectionHandler), 500);
-          });
-        } else {
-          // Unix: socket file may exist but no listener - clean up and retry
-          console.log('[wmux] Cleaning up stale socket file and retrying...');
-          this.unixServer?.close();
-          try {
-            fs.unlinkSync(this.unixSocketPath);
-          } catch {}
-          setTimeout(() => this.startUnixSocket(connectionHandler), 500);
-        }
-      } else {
-        // Log other errors for debugging
-        console.error(`[wmux] Unix socket error (${err.code || 'unknown'}):`, err.message);
-        if (process.platform === 'win32' && (err.code === 'ENOTSUP' || err.code === 'ENOENT' || err.message.includes('not supported'))) {
-          console.warn('[wmux] Unix sockets may not be supported on this Windows version (requires Windows 10 build 17063+)');
-          console.warn('[wmux] WSL bridge will not be available, but local named pipe still works');
-        }
+        // Pipe already exists, try to clean up and retry
+        net.connect({ path: this.pipePath }, () => {}).on('error', () => {
+          // No one is listening, safe to unlink and retry
+          this.server?.close();
+          // On Windows, just retry after a short delay
+          setTimeout(() => this.start(), 500);
+        });
       }
     });
   }
 
   stop(): void {
-    this.pipeServer?.close();
-    this.pipeServer = null;
-
-    this.unixServer?.close();
-    this.unixServer = null;
-
-    // Clean up Unix socket file on non-Windows platforms
-    if (process.platform !== 'win32') {
-      try {
-        fs.unlinkSync(this.unixSocketPath);
-      } catch {
-        // Ignore cleanup errors
-      }
-    }
+    this.server?.close();
+    this.server = null;
   }
 
   private handleV1(line: string, socket: net.Socket): void {

@@ -7,7 +7,7 @@ import { PipeServer } from './pipe-server';
 import { PortScanner } from './port-scanner';
 import { CDPProxy } from './cdp-proxy';
 import { IPC_CHANNELS, SurfaceId } from '../shared/types';
-import { getPipePath, getAppDataDir, ensurePipeToken, getUnixSocketPath } from '../shared/instance';
+import { getPipePath, getAppDataDir, ensurePipeToken } from '../shared/instance';
 import { loadSession, saveSession, handleVersionChange, SessionData } from './session-persistence';
 import { sessionWindows, MAX_RESTORED_WINDOWS } from './session-windows';
 import { WindowManager } from './window-manager';
@@ -147,19 +147,6 @@ function handleWindowV2(
 // as WMUX_PIPE_TOKEN so the CLI and hooks can authenticate.
 const pipeToken = ensurePipeToken();
 process.env.WMUX_PIPE_TOKEN = pipeToken;
-process.env.WMUX_PIPE = getPipePath();
-process.env.WMUX_UNIX_SOCKET = getUnixSocketPath();
-
-// On Windows, log the Unix socket path for WSL users
-if (process.platform === 'win32') {
-  const unixPath = getUnixSocketPath();
-  console.log(`[wmux] Unix socket for WSL bridge: ${unixPath}`);
-  // Convert Windows path to WSL path format for user convenience
-  const wslPath = unixPath.replace(/^([A-Z]):\\/, (_, drive) => `/mnt/${drive.toLowerCase()}/`)
-                         .replace(/\\/g, '/');
-  console.log(`[wmux] From WSL: export WMUX_UNIX_SOCKET="${wslPath}"`);
-}
-
 const pipeServer = new PipeServer(getPipePath(), pipeToken);
 const portScanner = new PortScanner();
 const cdpProxy = new CDPProxy();
