@@ -4,6 +4,8 @@ import net from 'net';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { spawn } from 'child_process';
+import { Duplex } from 'stream';
 
 // Respect WMUX_PIPE when set (e.g. by a parent wmux running with WMUX_INSTANCE),
 // so the CLI talks to the same instance that spawned the shell.
@@ -29,10 +31,113 @@ function parseRemoteTarget(spec: string): { host: string; port: number } {
   return { host: spec.slice(0, idx) || '127.0.0.1', port };
 }
 
-function connectTransport(onConnect: () => void): net.Socket {
-  return remoteTarget
-    ? net.connect({ host: remoteTarget.host, port: remoteTarget.port }, onConnect)
-    : net.connect({ path: PIPE_PATH }, onConnect);
+// ─── WSL2 transport (issue #xxx: devcontainer API transport) ─────────────────
+//
+// WSL2 → Windows IPC: approached investigated, decision made.
+//
+// GOAL: wmux CLI running inside a WSL2 devcontainer needs to talk to the wmux
+//       process on the Windows host over the \\.\pipe\wmux named pipe.
+//
+// OPTION A — AF_VSOCK (ideal, zero network, no deps):
+//   WSL2 exposes AF_VSOCK via the hv_sock driver (confirmed in dmesg).
+//   Windows registers services via HKLM\...\GuestCommunicationServices and
+//   listens on AF_HYPERV. In theory port 9787 maps to the service GUID
+//   {0000263b-facb-11e6-bd58-64006a7986d3}.
+//   BLOCKED: WSL2 runs as an HCS "VirtualMachine" with Owner="WSL" — a
+//   restricted UVM profile. GuestCommunicationServices registry entries are
+//   ignored for HCS-managed VMs. Dynamic registration via HcsModifyComputeSystem
+//   also fails (0x8037010D "invalid JSON document" for all device-addition
+//   schemas). WSL2 registers its own socket services (e.g. port 50000 for
+//   interop) through a proprietary code path in wslservice.exe at VM creation
+//   time, not via any public API. This approach requires reverse-engineering
+//   wslservice.exe and is not viable.
+//
+// OPTION B — TCP over WSL2 bridge gateway:
+//   wmux bridge --wsl binds on 0.0.0.0:9787. From WSL2, connect via the
+//   NAT gateway IP (172.x.x.x, read from /etc/resolv.conf).
+//   BLOCKED in corporate environment: gateway IP varies across Bosch network
+//   configurations; firewall policy prevents inbound connections to Windows.
+//   WSL2 mirrored networking (localhost works from both sides) requires
+//   networkingMode=mirrored in .wslconfig — policy prevents that change.
+//
+// OPTION C — Unix sockets:
+//   Windows AF_UNIX sockets (afunix.sys, Win10 1803+) cannot be accessed from
+//   WSL2 via /mnt/c/... — the 9P filesystem driver does not forward socket ops.
+//   Unix sockets inside the WSL2 Linux filesystem (/tmp/...) are inaccessible
+//   from the Windows side. Cross-boundary Unix sockets don't work in WSL2.
+//
+// CHOSEN: named pipe + npiperelay.exe (Option D)
+//   npiperelay.exe is a tiny (~2MB) open-source Windows binary that reads a
+//   named pipe and forwards it to its own stdin/stdout. WSL2 can execute Windows
+//   binaries via interop, so from inside WSL2 we spawn npiperelay.exe and use
+//   its stdio as the transport duplex — zero pre-setup, no socat needed.
+//   Security: the binary is verified by SHA-256 before first use (see
+//   src/vsock-tests/wsl-npiperelay-setup.sh for the download/verify helper).
+//   Source: https://github.com/albertony/npiperelay (MIT, fork of jstarks/npiperelay)
+//   Pinned version: v1.11.4  SHA-256: cea82cf5c9c22a28bef8075750acb7958f766393baebff4597cf21442f71c4b3
+//
+//   Transport selection order inside WSL2:
+//     1. WMUX_PIPE starts with '/' → use as Unix socket (manual pre-setup, socat)
+//     2. WSL_DISTRO_NAME / WSLENV set → spawn npiperelay.exe automatically
+//     3. Windows: connect directly to the named pipe
+// ─────────────────────────────────────────────────────────────────────────────
+function connectTransport(onConnect: () => void): net.Socket | Duplex {
+  if (remoteTarget)
+    return net.connect({ host: remoteTarget.host, port: remoteTarget.port }, onConnect);
+  // WMUX_PIPE pointing at a Unix socket (pre-setup by wsl-npiperelay-setup.sh or similar)
+  if (PIPE_PATH.startsWith('/'))
+    return net.connect({ path: PIPE_PATH }, onConnect);
+  // Inside WSL2: relay through npiperelay.exe (Windows binary, called via interop)
+  if (process.env.WSL_DISTRO_NAME || process.env.WSLENV)
+    return connectViaNpiperelay(PIPE_PATH, onConnect);
+  // Windows: connect directly to the named pipe
+  return net.connect({ path: PIPE_PATH }, onConnect);
+}
+
+// Search common installation locations for npiperelay.exe.
+function findNpiperelay(): string | null {
+  const candidates = [
+    path.join(os.homedir(), '.local', 'bin', 'npiperelay.exe'),
+    '/usr/local/bin/npiperelay.exe',
+    '/usr/bin/npiperelay.exe',
+  ];
+  const fromPath = (process.env.PATH || '').split(':').map(d => path.join(d, 'npiperelay.exe'))
+    .find(p => { try { fs.accessSync(p); return true; } catch { return false; } });
+  if (fromPath) return fromPath;
+  return candidates.find(p => { try { fs.accessSync(p); return true; } catch { return false; } }) ?? null;
+}
+
+// Spawn npiperelay.exe and expose its stdin/stdout as a Duplex stream.
+function connectViaNpiperelay(pipePath: string, onConnect: () => void): Duplex {
+  const bin = findNpiperelay();
+  if (!bin) {
+    console.error('wmux: npiperelay.exe not found.');
+    console.error('  Install it to ~/.local/bin/npiperelay.exe from:');
+    console.error('  https://github.com/albertony/npiperelay/releases/latest');
+    process.exit(1);
+  }
+  // Convert Windows pipe path \\.\ to //./ for npiperelay
+  const relayPath = pipePath.replace(/\\/g, '/');
+  const child = spawn(bin, ['-ei', '-s', relayPath], { stdio: ['pipe', 'pipe', 'inherit'] });
+  const duplex = new Duplex({
+    read() {},
+    write(chunk, enc, cb) {
+      if (!child.stdin?.writable) { cb(new Error('npiperelay stdin closed')); return; }
+      child.stdin.write(chunk, enc, cb);
+    },
+    final(cb) { child.stdin?.end(); cb(); },
+    destroy(err, cb) { child.kill(); cb(err); },
+    allowHalfOpen: true,
+  });
+  child.stdout?.on('data', (chunk: Buffer) => duplex.push(chunk));
+  child.stdout?.on('end', () => duplex.push(null));
+  child.on('error', (err: Error) => duplex.destroy(err));
+  child.on('exit', (code: number | null) => {
+    if (code !== 0 && code !== null) duplex.destroy(new Error(`npiperelay exited with code ${code}`));
+  });
+  // Connection is ready as soon as the process starts
+  process.nextTick(onConnect);
+  return duplex;
 }
 
 // Auth token for privileged (V2) pipe requests. wmux injects WMUX_PIPE_TOKEN
@@ -316,7 +421,10 @@ async function cmdSsh(args: string[]): Promise<void> {
 // wmux's pipe server, so the bridge grants nothing by itself.
 async function cmdBridge(args: string[]): Promise<void> {
   const port = parseInt(getFlag(args, '--port') || '', 10) || DEFAULT_BRIDGE_PORT;
-  const host = getFlag(args, '--host') || '127.0.0.1';
+  // --wsl flag: bind on 0.0.0.0 so WSL2 can reach us via the tap gateway IP.
+  // The auth token still protects the pipe; exposure is limited to LAN/VPN.
+  const wslMode = args.includes('--wsl');
+  const host = getFlag(args, '--host') || (wslMode ? '0.0.0.0' : '127.0.0.1');
   if (host !== '127.0.0.1' && host !== 'localhost') {
     console.warn('WARNING: binding beyond localhost exposes the wmux pipe to the network.');
     console.warn(`Prefer the default 127.0.0.1 + an SSH tunnel: ssh -L ${port}:127.0.0.1:${port} user@host`);
@@ -334,9 +442,15 @@ async function cmdBridge(args: string[]): Promise<void> {
   server.on('error', (err) => { console.error(`bridge error: ${err.message}`); process.exit(1); });
   server.listen(port, host, () => {
     console.log(`wmux bridge listening on ${host}:${port} ↔ ${PIPE_PATH}`);
-    console.log('From another machine:');
-    console.log(`  ssh -L ${port}:127.0.0.1:${port} <user>@<this-host>`);
-    console.log(`  wmux --remote 127.0.0.1:${port} --token <run 'wmux token' here> list-workspaces`);
+    if (wslMode) {
+      console.log('WSL2 mode: from WSL2 terminal run:');
+      console.log(`  WMUX_WSL_GATEWAY=$(ip route show default | awk '/default/{print $3}')`);
+      console.log(`  wmux --remote $WMUX_WSL_GATEWAY:${port} --token $(cmd.exe /c "wmux token" 2>/dev/null | tr -d '\\r') list-workspaces`);
+    } else {
+      console.log('From another machine:');
+      console.log(`  ssh -L ${port}:127.0.0.1:${port} <user>@<this-host>`);
+      console.log(`  wmux --remote 127.0.0.1:${port} --token <run 'wmux token' here> list-workspaces`);
+    }
     console.log('Ctrl+C to stop.');
   });
 }
@@ -579,7 +693,7 @@ const COMMAND_SPECS = {
 
   // Remote management (issue #78)
   bridge: {
-    usage: 'wmux bridge [--port P] [--host H]   (expose this wmux\'s pipe over TCP, default 127.0.0.1:9787)',
+    usage: 'wmux bridge [--port P] [--host H] [--wsl]   (expose this wmux\'s pipe over TCP; --wsl binds 0.0.0.0 for WSL2 access)',
     value: ['--port', '--host'],
   },
   token: { usage: 'wmux token   (print this instance\'s pipe auth token)' },
