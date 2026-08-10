@@ -24,7 +24,10 @@
  */
 
 using System;
+using System.Diagnostics;
+using System.Linq;
 using System.Runtime.InteropServices;
+using System.ServiceProcess;
 using System.Text;
 using System.Threading;
 using Microsoft.Win32;
@@ -42,6 +45,10 @@ namespace WmuxVsockDemo
         private const int SOCKET_ERROR = -1;
         private static readonly IntPtr INVALID_SOCKET = new IntPtr(-1);
         private const int DEFAULT_PORT = 9787;
+        private const int SOL_SOCKET = 0xFFFF;
+        private const int SO_RCVTIMEO = 0x1006;
+        private const int SO_SNDTIMEO = 0x1005;
+        private static Stopwatch _startTime = Stopwatch.StartNew();
 
         [DllImport("ws2_32.dll", SetLastError = true)]
         private static extern int WSAStartup(ushort wVersionRequested, out WSAData lpWSAData);
@@ -73,6 +80,9 @@ namespace WmuxVsockDemo
         [DllImport("ws2_32.dll", SetLastError = true)]
         private static extern int closesocket(IntPtr s);
 
+        [DllImport("ws2_32.dll", SetLastError = true)]
+        private static extern int setsockopt(IntPtr s, int level, int optname, ref int optval, int optlen);
+
         [StructLayout(LayoutKind.Sequential)]
         private struct WSAData
         {
@@ -99,6 +109,27 @@ namespace WmuxVsockDemo
 
         private static volatile bool _running = true;
 
+        private static string GetWSAErrorName(int errCode)
+        {
+            if (errCode == 10013) return "WSAEACCES (10013) - Permission denied";
+            if (errCode == 10048) return "WSAEADDRINUSE (10048) - Address already in use";
+            if (errCode == 10049) return "WSAEADDRNOTAVAIL (10049) - Cannot assign requested address";
+            if (errCode == 10047) return "WSAEAFNOSUPPORT (10047) - Address family not supported";
+            if (errCode == 10041) return "WSAEPROTONOSUPPORT (10041) - Protocol not supported";
+            if (errCode == 10060) return "WSAETIMEDOUT (10060) - Connection timed out";
+            if (errCode == 10061) return "WSAECONNREFUSED (10061) - Connection refused";
+            if (errCode == 10054) return "WSAECONNRESET (10054) - Connection reset by peer";
+            return "WSA Error " + errCode;
+        }
+
+        private static void Log(string message)
+        {
+            var ts = _startTime.Elapsed;
+            string time = ts.Hours.ToString("D2") + ":" + ts.Minutes.ToString("D2") + ":" + 
+                         ts.Seconds.ToString("D2") + "." + ts.Milliseconds.ToString("D3");
+            Console.WriteLine("[" + time + "] " + message);
+        }
+
         // Derive the AF_HYPERV service GUID from a vsock port (single source of truth).
         private static Guid ServiceGuidForPort(int port)
         {
@@ -118,9 +149,53 @@ namespace WmuxVsockDemo
 
             Console.WriteLine("Windows host AF_HYPERV echo server");
             Console.WriteLine("==================================");
+            Log("Initialization started");
             Console.WriteLine("  vsock port   : " + port);
             Console.WriteLine("  service GUID : " + serviceId);
             Console.WriteLine("  transport    : pure AF_HYPERV (no TCP, no IP, no firewall)");
+            Console.WriteLine();
+
+            // Pre-flight checks
+            Log("Running pre-flight diagnostics...");
+            try
+            {
+                var hvService = ServiceController.GetServices()
+                    .FirstOrDefault(s => s.ServiceName == "vmms");
+                if (hvService != null)
+                {
+                    Log("  Hyper-V service status: " + hvService.Status);
+                }
+                else
+                {
+                    Log("  WARNING: Hyper-V service (vmms) not found");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("  Could not check Hyper-V service: " + ex.Message);
+            }
+
+            // Check registry for service GUID
+            try
+            {
+                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(
+                    @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization\GuestCommunicationServices\" + serviceId))
+                {
+                    if (key != null)
+                    {
+                        var value = key.GetValue("ElementName");
+                        Log("  Service already registered: " + value);
+                    }
+                    else
+                    {
+                        Log("  Service not yet registered (will attempt registration)");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("  Could not check registry: " + ex.Message);
+            }
             Console.WriteLine();
 
             if (!RegisterService(serviceId))
@@ -129,23 +204,28 @@ namespace WmuxVsockDemo
             }
 
             WSAData wsa;
+            Log("Calling WSAStartup(0x0202)...");
             int startup = WSAStartup(0x0202, out wsa);
             if (startup != 0)
             {
-                Console.WriteLine("[ERROR] WSAStartup failed: " + startup);
+                Log("[ERROR] WSAStartup failed: " + startup);
                 return 1;
             }
+            Log("  WSAStartup OK - Winsock " + wsa.wVersion.ToString("X2") + "." + wsa.wHighVersion.ToString("X2"));
 
             IntPtr listener = INVALID_SOCKET;
             try
             {
+                Log("Creating AF_HYPERV socket(AF_HYPERV, SOCK_STREAM, HV_PROTOCOL_RAW)...");
                 listener = socket(AF_HYPERV, SOCK_STREAM, HV_PROTOCOL_RAW);
                 if (listener == INVALID_SOCKET)
                 {
-                    Console.WriteLine("[ERROR] AF_HYPERV socket() failed: " + WSAGetLastError());
+                    int err = WSAGetLastError();
+                    Log("[ERROR] socket() failed: " + GetWSAErrorName(err));
                     Console.WriteLine("        Hyper-V sockets require the Windows Hypervisor Platform / WSL2.");
                     return 1;
                 }
+                Log("  Socket handle created: " + listener);
 
                 var addr = new SockaddrHv
                 {
@@ -155,24 +235,48 @@ namespace WmuxVsockDemo
                     ServiceId = serviceId,
                 };
 
+                Log("  Address: VmId=" + addr.VmId + " (wildcard), ServiceId=" + addr.ServiceId);
                 byte[] addrBytes = StructToBytes(addr);
+                Log("  Calling bind(listener, addrBytes[" + addrBytes.Length + "])...");
                 if (bind(listener, addrBytes, addrBytes.Length) == SOCKET_ERROR)
                 {
-                    Console.WriteLine("[ERROR] bind() failed: " + WSAGetLastError());
+                    int err = WSAGetLastError();
+                    Log("[ERROR] bind() failed: " + GetWSAErrorName(err));
                     return 1;
                 }
+                Log("  bind() OK");
 
+                // Set socket timeouts to detect stuck connections
+                int recvTimeout = 30000; // 30 seconds
+                int sendTimeout = 30000; // 30 seconds
+                Log("  Setting socket timeouts: recv=" + recvTimeout + "ms, send=" + sendTimeout + "ms");
+                if (setsockopt(listener, SOL_SOCKET, SO_RCVTIMEO, ref recvTimeout, sizeof(int)) == SOCKET_ERROR)
+                {
+                    int err = WSAGetLastError();
+                    Log("[WARN] setsockopt(SO_RCVTIMEO) failed: " + GetWSAErrorName(err));
+                }
+                if (setsockopt(listener, SOL_SOCKET, SO_SNDTIMEO, ref sendTimeout, sizeof(int)) == SOCKET_ERROR)
+                {
+                    int err = WSAGetLastError();
+                    Log("[WARN] setsockopt(SO_SNDTIMEO) failed: " + GetWSAErrorName(err));
+                }
+
+                Log("Calling listen(listener, 5)...");
                 if (listen(listener, 5) == SOCKET_ERROR)
                 {
-                    Console.WriteLine("[ERROR] listen() failed: " + WSAGetLastError());
+                    int err = WSAGetLastError();
+                    Log("[ERROR] listen() failed: " + GetWSAErrorName(err));
                     return 1;
                 }
+                Log("  listen() OK");
 
-                Console.WriteLine("[OK] Listening. Waiting for the WSL2 vsock client...");
+                Log("[OK] Listening for AF_HYPERV connections.");
+                Console.WriteLine();
                 Console.WriteLine("     Test from WSL2:");
                 Console.WriteLine("       node wsl-vsock-echo-client.js --message \"Hello vsock\" --port " + port);
                 Console.WriteLine();
                 Console.WriteLine("Press Ctrl+C to stop.");
+                Console.WriteLine();
 
                 Console.CancelKeyPress += (s, e) =>
                 {
@@ -188,6 +292,7 @@ namespace WmuxVsockDemo
 
                 while (_running)
                 {
+                    Log("Waiting for accept()...");
                     IntPtr client = accept(listener, IntPtr.Zero, IntPtr.Zero);
                     if (client == INVALID_SOCKET)
                     {
@@ -195,12 +300,13 @@ namespace WmuxVsockDemo
                         {
                             break;
                         }
-                        Console.WriteLine("[WARN] accept() failed: " + WSAGetLastError());
+                        int err = WSAGetLastError();
+                        Log("[WARN] accept() failed: " + GetWSAErrorName(err));
                         continue;
                     }
 
                     string id = Guid.NewGuid().ToString("N").Substring(0, 8);
-                    Console.WriteLine("[" + id + "] vsock client connected");
+                    Log("[" + id + "] Client connected (socket handle: " + client + ")");
                     var t = new Thread(() => HandleClient(client, id));
                     t.IsBackground = true;
                     t.Start();
@@ -226,34 +332,46 @@ namespace WmuxVsockDemo
                 var buffer = new byte[4096];
                 while (_running)
                 {
+                    Log("[" + id + "] Calling recv()...");
                     int read = recv(client, buffer, buffer.Length, 0);
                     if (read <= 0)
                     {
+                        if (read == 0)
+                        {
+                            Log("[" + id + "] recv() returned 0 (peer closed)");
+                        }
+                        else
+                        {
+                            int err = WSAGetLastError();
+                            Log("[" + id + "] recv() failed: " + GetWSAErrorName(err));
+                        }
                         break;
                     }
 
                     string message = Encoding.UTF8.GetString(buffer, 0, read).TrimEnd('\r', '\n');
-                    Console.WriteLine("[" + id + "] RECV: " + message);
+                    Log("[" + id + "] RECV: " + read + " bytes: " + message);
 
                     string reply = "[ECHO] " + message + "\n";
                     byte[] replyBytes = Encoding.UTF8.GetBytes(reply);
+                    Log("[" + id + "] Calling send(" + replyBytes.Length + " bytes)...");
                     int sent = send(client, replyBytes, replyBytes.Length, 0);
                     if (sent == SOCKET_ERROR)
                     {
-                        Console.WriteLine("[" + id + "] send() failed: " + WSAGetLastError());
+                        int err = WSAGetLastError();
+                        Log("[" + id + "] send() failed: " + GetWSAErrorName(err));
                         break;
                     }
-                    Console.WriteLine("[" + id + "] SENT: " + reply.TrimEnd('\n'));
+                    Log("[" + id + "] SENT: " + sent + " bytes: " + reply.TrimEnd('\n'));
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine("[" + id + "] error: " + ex.Message);
+                Log("[" + id + "] Exception: " + ex.Message);
             }
             finally
             {
                 closesocket(client);
-                Console.WriteLine("[" + id + "] disconnected");
+                Log("[" + id + "] disconnected");
             }
         }
 
@@ -271,8 +389,16 @@ namespace WmuxVsockDemo
                         return false;
                     }
                     key.SetValue("ElementName", "wmux vsock echo demo");
+                    // GuestDefinedCapabilities: required for guest discovery and access
+                    key.SetValue("GuestDefinedCapabilities", "GuestCommunicationService");
+                    // Owner: optional but helps identify the service owner
+                    key.SetValue("Owner", "ComputeSystem");
                 }
                 Console.WriteLine("[OK] Service GUID registered under GuestCommunicationServices.");
+                Console.WriteLine("     Values set:");
+                Console.WriteLine("       ElementName: wmux vsock echo demo");
+                Console.WriteLine("       GuestDefinedCapabilities: GuestCommunicationService");
+                Console.WriteLine("       Owner: ComputeSystem");
                 return true;
             }
             catch (UnauthorizedAccessException)
