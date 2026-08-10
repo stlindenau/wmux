@@ -14,9 +14,9 @@ if (!(Test-Path $regPath)) {
     exit 1
 }
 
-# Set GuestDefinedCapabilities - allows any guest to connect
+# Set GuestDefinedCapabilities with curly braces (GUID format)
 Write-Host "Setting GuestDefinedCapabilities..." -ForegroundColor Yellow
-$capabilities = "GuestCommunicationService"
+$capabilities = "{$guid}"
 Set-ItemProperty -Path $regPath -Name "GuestDefinedCapabilities" -Value $capabilities -Type String -Force
 Write-Host "  GuestDefinedCapabilities = $capabilities" -ForegroundColor Green
 

@@ -290,10 +290,15 @@ namespace WmuxVsockDemo
                     }
                 };
 
+                int acceptCount = 0;
                 while (_running)
                 {
-                    Log("Waiting for accept()...");
+                    acceptCount++;
+                    Log("Waiting for accept() [iteration " + acceptCount + "]...");
+                    long acceptStartMs = DateTime.UtcNow.Ticks / 10000;
                     IntPtr client = accept(listener, IntPtr.Zero, IntPtr.Zero);
+                    long acceptElapsedMs = (DateTime.UtcNow.Ticks / 10000) - acceptStartMs;
+                    
                     if (client == INVALID_SOCKET)
                     {
                         if (!_running)
@@ -301,12 +306,12 @@ namespace WmuxVsockDemo
                             break;
                         }
                         int err = WSAGetLastError();
-                        Log("[WARN] accept() failed: " + GetWSAErrorName(err));
+                        Log("[WARN] accept() iteration " + acceptCount + " failed after " + acceptElapsedMs + "ms: " + GetWSAErrorName(err));
                         continue;
                     }
 
                     string id = Guid.NewGuid().ToString("N").Substring(0, 8);
-                    Log("[" + id + "] Client connected (socket handle: " + client + ")");
+                    Log("[" + id + "] Client connected after " + acceptElapsedMs + "ms (socket handle: " + client + ")");
                     var t = new Thread(() => HandleClient(client, id));
                     t.IsBackground = true;
                     t.Start();
@@ -389,15 +394,17 @@ namespace WmuxVsockDemo
                         return false;
                     }
                     key.SetValue("ElementName", "wmux vsock echo demo");
-                    // GuestDefinedCapabilities: required for guest discovery and access
-                    key.SetValue("GuestDefinedCapabilities", "GuestCommunicationService");
+                    // GuestDefinedCapabilities: set as the GUID string in curly braces (standard format)
+                    key.SetValue("GuestDefinedCapabilities", "{" + serviceId.ToString() + "}");
                     // Owner: optional but helps identify the service owner
                     key.SetValue("Owner", "ComputeSystem");
+                    // Required Endpoint: standard for AF_HYPERV services
+                    key.SetValue("RequiredGuestServices", "");
                 }
                 Console.WriteLine("[OK] Service GUID registered under GuestCommunicationServices.");
                 Console.WriteLine("     Values set:");
                 Console.WriteLine("       ElementName: wmux vsock echo demo");
-                Console.WriteLine("       GuestDefinedCapabilities: GuestCommunicationService");
+                Console.WriteLine("       GuestDefinedCapabilities: {" + serviceId.ToString() + "}");
                 Console.WriteLine("       Owner: ComputeSystem");
                 return true;
             }

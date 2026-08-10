@@ -114,10 +114,13 @@ function run(vsock, opts) {
   console.log(`  target       : CID ${opts.cid}, port ${opts.port}`);
   console.log(`  host service : ${guid}`);
   console.log(`  message      : ${opts.message}`);
+  console.log(`  timeout      : ${opts.timeout}ms`);
   console.log('');
 
   return new Promise((resolve, reject) => {
+    console.log('[' + new Date().toISOString() + '] Creating VsockSocket instance...');
     const socket = new VsockSocket();
+    console.log('[' + new Date().toISOString() + '] VsockSocket created.');
     let settled = false;
     let gotEcho = false;
 
@@ -125,39 +128,53 @@ function run(vsock, opts) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      try { socket.destroy(); } catch { /* ignore */ }
+      console.log('[' + new Date().toISOString() + '] Closing socket...');
+      try { socket.destroy(); } catch (e) { console.error('  Error destroying socket: ' + e.message); }
       if (err) reject(err); else resolve(gotEcho);
     };
 
     const timer = setTimeout(() => {
-      const err = new Error(`Connection/response timeout (${opts.timeout}ms)`);
+      console.error('[' + new Date().toISOString() + '] Timeout after ' + opts.timeout + 'ms');
+      const err = new Error('Connection/response timeout (' + opts.timeout + 'ms)');
       err.code = 'ETIMEDOUT';
       finish(err);
     }, opts.timeout);
 
     socket.on('data', (buf) => {
       gotEcho = true;
-      console.log(`RECV from host: ${buf.toString().trim()}`);
+      console.log('[' + new Date().toISOString() + '] socket.data received: ' + buf.toString().trim());
       // One request/response cycle is enough to prove the transport.
       socket.end(() => finish(null));
       // Fallback in case 'end' callback does not fire promptly.
       setTimeout(() => finish(null), 500);
     });
 
-    socket.on('error', (err) => finish(err));
-    socket.on('end', () => { if (gotEcho) finish(null); });
-    socket.on('close', () => { if (gotEcho) finish(null); });
+    socket.on('error', (err) => {
+      console.error('[' + new Date().toISOString() + '] socket.error: ' + err.message + ' (code=' + err.code + ')');
+      finish(err);
+    });
+    socket.on('end', () => {
+      console.log('[' + new Date().toISOString() + '] socket.end event');
+      if (gotEcho) finish(null);
+    });
+    socket.on('close', () => {
+      console.log('[' + new Date().toISOString() + '] socket.close event');
+      if (gotEcho) finish(null);
+    });
 
     // node-vsock's connect callback takes NO arguments; errors arrive via 'error'.
+    console.log('[' + new Date().toISOString() + '] Calling socket.connect(' + opts.cid + ', ' + opts.port + ')...');
+    const connectStart = Date.now();
     socket.connect(opts.cid, opts.port, () => {
-      console.log('Connection established (AF_VSOCK).');
+      const connectElapsed = Date.now() - connectStart;
+      console.log('[' + new Date().toISOString() + '] Connection established after ' + connectElapsed + 'ms (AF_VSOCK).');
       const payload = JSON.stringify({
         type: 'vsock-echo',
         content: opts.message,
         source: 'wsl2-vsock-echo-client',
         transport: 'AF_VSOCK',
       });
-      console.log(`SEND to host  : ${payload}`);
+      console.log('SEND to host  : ' + payload);
       socket.writeTextSync(payload + '\n');
     });
   });
