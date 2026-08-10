@@ -36,6 +36,9 @@ namespace WmuxVsockDemo
         // AF_HYPERV socket family and helpers.
         private const int AF_HYPERV = 34;
         private const int SOCK_STREAM = 1;
+        // Hyper-V sockets MUST be created with protocol HV_PROTOCOL_RAW (1); passing 0
+        // yields WSAEPROTONOSUPPORT (10041).
+        private const int HV_PROTOCOL_RAW = 1;
         private const int SOCKET_ERROR = -1;
         private static readonly IntPtr INVALID_SOCKET = new IntPtr(-1);
         private const int DEFAULT_PORT = 9787;
@@ -136,7 +139,7 @@ namespace WmuxVsockDemo
             IntPtr listener = INVALID_SOCKET;
             try
             {
-                listener = socket(AF_HYPERV, SOCK_STREAM, 0);
+                listener = socket(AF_HYPERV, SOCK_STREAM, HV_PROTOCOL_RAW);
                 if (listener == INVALID_SOCKET)
                 {
                     Console.WriteLine("[ERROR] AF_HYPERV socket() failed: " + WSAGetLastError());
