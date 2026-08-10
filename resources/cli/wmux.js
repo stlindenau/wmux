@@ -1,5 +1,9 @@
 #!/usr/bin/env node
 "use strict";
+// Parts of this file are created by genAI.
+// This notice needs to remain attached to any reproduction of or excerpt from this file.
+// Agent: Claude Code
+// AI-assisted: Yes
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
@@ -8,6 +12,8 @@ const net_1 = __importDefault(require("net"));
 const fs_1 = __importDefault(require("fs"));
 const os_1 = __importDefault(require("os"));
 const path_1 = __importDefault(require("path"));
+const child_process_1 = require("child_process");
+const stream_1 = require("stream");
 // Respect WMUX_PIPE when set (e.g. by a parent wmux running with WMUX_INSTANCE),
 // so the CLI talks to the same instance that spawned the shell.
 const PIPE_PATH = process.env.WMUX_PIPE || '\\\\.\\pipe\\wmux';
@@ -30,10 +36,102 @@ function parseRemoteTarget(spec) {
     }
     return { host: spec.slice(0, idx) || '127.0.0.1', port };
 }
+// ─── WSL2 transport: reach the Windows \\.\pipe\wmux from inside WSL2 ─────────
+//
+// A wmux CLI (or `wmux bridge`) running inside WSL2 needs to talk to the wmux
+// process on the Windows host over the \\.\pipe\wmux named pipe. AF_VSOCK,
+// TCP-over-gateway and cross-boundary Unix sockets were all evaluated and
+// rejected (HCS-managed WSL2 UVMs ignore GuestCommunicationServices; gateway
+// IPs/firewall policy are unreliable on corporate networks; 9P does not forward
+// AF_UNIX). The chosen mechanism is npiperelay.exe:
+//
+//   npiperelay.exe is a tiny (~2MB) open-source Windows binary that forwards a
+//   named pipe to its own stdin/stdout. WSL2 executes Windows binaries via
+//   interop, so from inside WSL2 we spawn it and use its stdio as the transport
+//   duplex — zero pre-setup, no socat needed. Install it (SHA-256 pinned) with
+//   scripts/install-npiperelay.sh; see resources/wmux-orchestrator/docs/DEVCONTAINER.md.
+//   Source: https://github.com/albertony/npiperelay (MIT, fork of jstarks/npiperelay)
+//   Pinned version: v1.11.4  SHA-256: cea82cf5c9c22a28bef8075750acb7958f766393baebff4597cf21442f71c4b3
+//
+//   Transport selection order (connectTransport, below):
+//     0. remoteTarget set (--remote / WMUX_REMOTE) → TCP (the devcontainer path,
+//        served by a `wmux bridge` reachable at host.docker.internal:9787)
+//     1. WMUX_PIPE starts with '/' → use as a Unix socket path
+//     2. WSL_DISTRO_NAME / WSLENV set → spawn npiperelay.exe automatically
+//     3. native Windows → connect directly to the named pipe
+// ─────────────────────────────────────────────────────────────────────────────
 function connectTransport(onConnect) {
-    return remoteTarget
-        ? net_1.default.connect({ host: remoteTarget.host, port: remoteTarget.port }, onConnect)
-        : net_1.default.connect({ path: PIPE_PATH }, onConnect);
+    if (remoteTarget)
+        return net_1.default.connect({ host: remoteTarget.host, port: remoteTarget.port }, onConnect);
+    // WMUX_PIPE pointing at a Unix socket path
+    if (PIPE_PATH.startsWith('/'))
+        return net_1.default.connect({ path: PIPE_PATH }, onConnect);
+    // Inside WSL2: relay through npiperelay.exe (Windows binary, called via interop)
+    if (process.env.WSL_DISTRO_NAME || process.env.WSLENV)
+        return connectViaNpiperelay(PIPE_PATH, onConnect);
+    // Windows: connect directly to the named pipe
+    return net_1.default.connect({ path: PIPE_PATH }, onConnect);
+}
+// Search common installation locations for npiperelay.exe.
+function findNpiperelay() {
+    const candidates = [
+        path_1.default.join(os_1.default.homedir(), '.local', 'bin', 'npiperelay.exe'),
+        '/usr/local/bin/npiperelay.exe',
+        '/usr/bin/npiperelay.exe',
+    ];
+    const fromPath = (process.env.PATH || '').split(':').map(d => path_1.default.join(d, 'npiperelay.exe'))
+        .find(p => { try {
+        fs_1.default.accessSync(p);
+        return true;
+    }
+    catch {
+        return false;
+    } });
+    if (fromPath)
+        return fromPath;
+    return candidates.find(p => { try {
+        fs_1.default.accessSync(p);
+        return true;
+    }
+    catch {
+        return false;
+    } }) ?? null;
+}
+// Spawn npiperelay.exe and expose its stdin/stdout as a Duplex stream.
+function connectViaNpiperelay(pipePath, onConnect) {
+    const bin = findNpiperelay();
+    if (!bin) {
+        console.error('wmux: npiperelay.exe not found.');
+        console.error('  Install it to ~/.local/bin/npiperelay.exe from:');
+        console.error('  https://github.com/albertony/npiperelay/releases/latest');
+        process.exit(1);
+    }
+    // Convert Windows pipe path \\.\ to //./ for npiperelay
+    const relayPath = pipePath.replace(/\\/g, '/');
+    const child = (0, child_process_1.spawn)(bin, ['-ei', '-s', relayPath], { stdio: ['pipe', 'pipe', 'inherit'] });
+    const duplex = new stream_1.Duplex({
+        read() { },
+        write(chunk, enc, cb) {
+            if (!child.stdin?.writable) {
+                cb(new Error('npiperelay stdin closed'));
+                return;
+            }
+            child.stdin.write(chunk, enc, cb);
+        },
+        final(cb) { child.stdin?.end(); cb(); },
+        destroy(err, cb) { child.kill(); cb(err); },
+        allowHalfOpen: true,
+    });
+    child.stdout?.on('data', (chunk) => duplex.push(chunk));
+    child.stdout?.on('end', () => duplex.push(null));
+    child.on('error', (err) => duplex.destroy(err));
+    child.on('exit', (code) => {
+        if (code !== 0 && code !== null)
+            duplex.destroy(new Error(`npiperelay exited with code ${code}`));
+    });
+    // Connection is ready as soon as the process starts
+    process.nextTick(onConnect);
+    return duplex;
 }
 // Auth token for privileged (V2) pipe requests. wmux injects WMUX_PIPE_TOKEN
 // into the shells it spawns; for CLIs launched elsewhere, fall back to the
@@ -79,10 +177,12 @@ function sendV1(command) {
     });
 }
 function sendV2(method, params = {}) {
-    // Browser commands carry the caller's surface (WMUX_SURFACE_ID) so wmux can
-    // route each agent to its OWN browser pane — concurrent agents no longer share
-    // and clobber a single browser window (issue #62).
-    if (method.startsWith('browser.') && params.caller === undefined && process.env.WMUX_SURFACE_ID) {
+    // Every command carries the caller's surface (WMUX_SURFACE_ID). Browser
+    // commands use it to route each agent to its OWN browser pane, so concurrent
+    // agents no longer share and clobber one browser window (issue #62); the
+    // workspace/pane/surface commands use it to answer about the window the
+    // calling shell actually lives in rather than an arbitrary one (issue #141).
+    if (params.caller === undefined && process.env.WMUX_SURFACE_ID) {
         params = { ...params, caller: process.env.WMUX_SURFACE_ID };
     }
     return new Promise((resolve, reject) => {
@@ -284,8 +384,14 @@ async function cmdMarkdown(args) {
         const surfaceId = args[2];
         const contentFlag = args.indexOf('--content');
         const fileFlag = args.indexOf('--file');
+        const titleFlag = args.indexOf('--title');
+        const title = titleFlag !== -1 ? args[titleFlag + 1] : undefined;
         if (contentFlag !== -1) {
-            print(await sendV2('markdown.set_content', { surfaceId, markdown: args.slice(contentFlag + 1).join(' ') }));
+            // Stop at --title so it isn't swallowed into the content when it comes last.
+            const end = titleFlag > contentFlag ? titleFlag : args.length;
+            print(await sendV2('markdown.set_content', {
+                surfaceId, markdown: args.slice(contentFlag + 1, end).join(' '), title,
+            }));
         }
         else if (fileFlag !== -1) {
             // Resolve against the terminal's cwd — the main-process cwd differs.
@@ -293,9 +399,13 @@ async function cmdMarkdown(args) {
             print(await sendV2('markdown.load_file', { surfaceId, filePath }));
         }
         else {
-            console.error('Usage: wmux markdown set <id> --content <text> | --file <path>');
+            console.error('Usage: wmux markdown set <id> --content <text> [--title T] | --file <path>');
             process.exit(1);
         }
+    }
+    else if (sub === 'get') {
+        // Read a surface's buffer back out — mirrors `read-screen` for terminals.
+        print(await sendV2('markdown.get_content', { surfaceId: args[2] }));
     }
     else if (sub) {
         // One-shot: `wmux markdown <file>` — create a markdown surface and load the
@@ -310,7 +420,7 @@ async function cmdMarkdown(args) {
         print(await sendV2('markdown.load_file', { surfaceId, filePath }));
     }
     else {
-        console.error('Usage: wmux markdown <file>  |  wmux markdown set <id> --content <text> | --file <path>');
+        console.error('Usage: wmux markdown <file>  |  wmux markdown set <id> --content <text> [--title T] | --file <path>  |  wmux markdown get <id>');
         process.exit(1);
     }
 }
@@ -357,13 +467,21 @@ async function cmdSsh(args) {
 // wmux's pipe server, so the bridge grants nothing by itself.
 async function cmdBridge(args) {
     const port = parseInt(getFlag(args, '--port') || '', 10) || DEFAULT_BRIDGE_PORT;
-    const host = getFlag(args, '--host') || '127.0.0.1';
+    // --wsl flag: bind on 0.0.0.0 so WSL2 can reach us via the tap gateway IP.
+    // The auth token still protects the pipe; exposure is limited to LAN/VPN.
+    const wslMode = args.includes('--wsl');
+    const host = getFlag(args, '--host') || (wslMode ? '0.0.0.0' : '127.0.0.1');
     if (host !== '127.0.0.1' && host !== 'localhost') {
         console.warn('WARNING: binding beyond localhost exposes the wmux pipe to the network.');
         console.warn(`Prefer the default 127.0.0.1 + an SSH tunnel: ssh -L ${port}:127.0.0.1:${port} user@host`);
     }
     const server = net_1.default.createServer((sock) => {
-        const pipe = net_1.default.connect({ path: PIPE_PATH });
+        // Connect to the local wmux via the same transport selector the CLI uses.
+        // In the bridge process remoteTarget is always null, so this resolves to:
+        // Unix socket (WMUX_PIPE=/path) → npiperelay.exe (inside WSL2) → the named
+        // pipe directly (native Windows). This is what lets `wmux bridge` run from
+        // inside WSL2 and still reach the Windows-host pipe over interop.
+        const pipe = connectTransport(() => { });
         sock.pipe(pipe);
         pipe.pipe(sock);
         const drop = () => { sock.destroy(); pipe.destroy(); };
@@ -375,9 +493,16 @@ async function cmdBridge(args) {
     server.on('error', (err) => { console.error(`bridge error: ${err.message}`); process.exit(1); });
     server.listen(port, host, () => {
         console.log(`wmux bridge listening on ${host}:${port} ↔ ${PIPE_PATH}`);
-        console.log('From another machine:');
-        console.log(`  ssh -L ${port}:127.0.0.1:${port} <user>@<this-host>`);
-        console.log(`  wmux --remote 127.0.0.1:${port} --token <run 'wmux token' here> list-workspaces`);
+        if (wslMode) {
+            console.log('WSL2 mode: from WSL2 terminal run:');
+            console.log(`  WMUX_WSL_GATEWAY=$(ip route show default | awk '/default/{print $3}')`);
+            console.log(`  wmux --remote $WMUX_WSL_GATEWAY:${port} --token $(cmd.exe /c "wmux token" 2>/dev/null | tr -d '\\r') list-workspaces`);
+        }
+        else {
+            console.log('From another machine:');
+            console.log(`  ssh -L ${port}:127.0.0.1:${port} <user>@<this-host>`);
+            console.log(`  wmux --remote 127.0.0.1:${port} --token <run 'wmux token' here> list-workspaces`);
+        }
         console.log('Ctrl+C to stop.');
     });
 }
@@ -490,9 +615,353 @@ async function cmdRawV1(args) {
     }
     console.log(await sendV1(line));
 }
+// ─── Declared agent state (issue #128) ───────────────────────────────────────
+// The reporting side of the protocol. An agent running inside a wmux pane can
+// call these with no arguments beyond the state itself — WMUX_SURFACE_ID is
+// already in its environment, so it never has to discover which pane it is in.
+/** Resolve the pane this command is about: --surface, else the ambient pane. */
+function reportingSurface(args, command) {
+    const surfaceId = getFlag(args, '--surface') || process.env.WMUX_SURFACE_ID;
+    if (!surfaceId) {
+        console.error(`${command}: --surface or WMUX_SURFACE_ID required`);
+        process.exit(1);
+    }
+    return surfaceId;
+}
+/** Optional monotonic sequence — wmux drops any report at or below the last seen. */
+function seqFlag(args) {
+    const raw = getFlag(args, '--seq');
+    if (!raw)
+        return undefined;
+    const seq = Number(raw);
+    return Number.isFinite(seq) ? seq : undefined;
+}
+async function cmdReportAgent(args) {
+    const surfaceId = reportingSurface(args, 'report-agent');
+    const params = { surfaceId, seq: seqFlag(args) };
+    // --blocked [reason] parks the pane on the user; --unblocked releases it.
+    if (args.includes('--blocked')) {
+        params.awaitingHuman = true;
+        params.reason = getFlag(args, '--blocked') || getFlag(args, '--reason') || null;
+    }
+    else if (args.includes('--unblocked')) {
+        params.awaitingHuman = false;
+    }
+    if (args.includes('--run-start'))
+        params.runDelta = 1;
+    if (args.includes('--run-end'))
+        params.runDelta = -1;
+    const depth = getFlag(args, '--run-depth');
+    if (depth !== undefined)
+        params.runDepth = Number(depth);
+    // --choices declares what wmux may offer as an answer (issue #128). JSON
+    // rather than a packed string because each choice carries four fields and the
+    // payload is exact bytes — the one place a cramped syntax would be a bug
+    // waiting to happen. Mirrors `agent spawn-batch --json`.
+    const choices = getFlag(args, '--choices');
+    if (choices !== undefined) {
+        try {
+            params.choices = JSON.parse(choices);
+        }
+        catch (err) {
+            console.error(`report-agent: --choices is not valid JSON: ${err.message}`);
+            process.exit(1);
+        }
+    }
+    print(await sendV2('pane.report_agent', params));
+}
+/**
+ * `answer-agent` — reply to a blocked pane from outside it (issue #128).
+ *
+ * Note this one defaults to NO ambient surface: the other verbs are an agent
+ * describing itself, where WMUX_SURFACE_ID is exactly right, but answering is
+ * aimed at a DIFFERENT pane — the whole point is to not be in it. Defaulting to
+ * the caller's own pane would make `wmux answer-agent --choice allow` type into
+ * whatever terminal you happen to be sitting in.
+ */
+async function cmdAnswerAgent(args) {
+    const surfaceId = getFlag(args, '--surface');
+    if (!surfaceId) {
+        console.error('answer-agent: --surface required (run `wmux agent-state` to see which panes are blocked)');
+        process.exit(1);
+    }
+    const choiceId = getFlag(args, '--choice') ?? args[1];
+    print(await sendV2('pane.answer_agent', { surfaceId, choiceId: choiceId ?? null }));
+}
+async function cmdReportMetadata(args) {
+    const surfaceId = reportingSurface(args, 'report-metadata');
+    const params = { surfaceId, seq: seqFlag(args) };
+    const model = getFlag(args, '--model');
+    if (model)
+        params.model = model;
+    const tokens = getFlag(args, '--tokens');
+    if (tokens)
+        params.tokens = tokens;
+    const pct = getFlag(args, '--context-pct');
+    if (pct)
+        params.contextPct = Number(pct);
+    const ttl = getFlag(args, '--ttl');
+    if (ttl)
+        params.ttlMs = Number(ttl);
+    print(await sendV2('pane.report_metadata', params));
+}
+// Keys stay inferred (no Record<string, …> annotation) so spreading this into
+// COMMANDS still satisfies the exhaustive Record<CommandName, …> check.
+const AGENT_STATE_COMMANDS = {
+    'report-agent': cmdReportAgent,
+    'report-metadata': cmdReportMetadata,
+    'report-session': async (args) => {
+        const surfaceId = reportingSurface(args, 'report-session');
+        print(await sendV2('pane.report_agent_session', {
+            surfaceId,
+            seq: seqFlag(args),
+            sessionId: getFlag(args, '--session') ?? args[1] ?? null,
+        }));
+    },
+    'answer-agent': cmdAnswerAgent,
+    'release-agent': async (args) => {
+        const surfaceId = reportingSurface(args, 'release-agent');
+        print(await sendV2('pane.release_agent', { surfaceId, seq: seqFlag(args) }));
+    },
+    // No --surface → the whole picture, including a `blocked` list that answers
+    // "which pane needs me?" in one call.
+    'agent-state': async (args) => {
+        const surfaceId = getFlag(args, '--surface');
+        print(await sendV2('pane.agent_state', surfaceId ? { surfaceId } : {}));
+    },
+};
+const SURFACE_NOTE = '(surface defaults to $WMUX_SURFACE_ID inside a pane)';
+const COMMAND_SPECS = {
+    // System
+    ping: { usage: 'wmux ping' },
+    identify: { usage: 'wmux identify' },
+    capabilities: { usage: 'wmux capabilities' },
+    'list-windows': { usage: 'wmux list-windows' },
+    'focus-window': { usage: 'wmux focus-window <windowId>' },
+    'new-window': { usage: 'wmux new-window' },
+    // Remote management (issue #78)
+    bridge: {
+        usage: 'wmux bridge [--port P] [--host H] [--wsl]   (expose this wmux\'s pipe over TCP; --wsl binds 0.0.0.0 for WSL2 access)',
+        value: ['--port', '--host'],
+        bool: ['--wsl'],
+    },
+    token: { usage: 'wmux token   (print this instance\'s pipe auth token)' },
+    // Workspace
+    'new-workspace': {
+        usage: 'wmux new-workspace [--title T] [--shell S] [--cwd D]',
+        value: ['--title', '--shell', '--cwd'],
+    },
+    ssh: { usage: 'wmux ssh [ssh options] <user@host> [--title T]', passthrough: true },
+    'close-workspace': { usage: 'wmux close-workspace [workspaceId]' },
+    'select-workspace': { usage: 'wmux select-workspace <workspaceId>' },
+    'rename-workspace': { usage: 'wmux rename-workspace <workspaceId> <title>', passthrough: true },
+    'list-workspaces': { usage: 'wmux list-workspaces' },
+    // Surface
+    'new-surface': {
+        usage: 'wmux new-surface [--type terminal|browser|markdown] [--color-scheme NAME]',
+        value: ['--type', '--color-scheme'],
+    },
+    'close-surface': { usage: 'wmux close-surface [surfaceId]' },
+    'rename-surface': {
+        usage: 'wmux rename-surface [surfaceId] <title>   (renames the current surface inside a pane)',
+        passthrough: true,
+    },
+    'focus-surface': { usage: 'wmux focus-surface <surfaceId>' },
+    'list-surfaces': {
+        usage: 'wmux list-surfaces [--pane <paneId>] [--workspace <workspaceId>]',
+        value: ['--pane', '--workspace'],
+    },
+    'set-color-scheme': { usage: 'wmux set-color-scheme [surfaceId] <scheme>' },
+    'clear-color-scheme': { usage: 'wmux clear-color-scheme [surfaceId]' },
+    'list-themes': { usage: 'wmux list-themes' },
+    themes: { usage: 'wmux themes   (alias of list-themes)' },
+    // User config
+    'reload-config': { usage: 'wmux reload-config' },
+    config: { usage: 'wmux config <show|reload|path>' },
+    // Pane
+    split: {
+        usage: 'wmux split [--down] [--type terminal|browser|markdown] [--color-scheme NAME]',
+        value: ['--type', '--color-scheme'],
+        bool: ['--down'],
+    },
+    pane: {
+        usage: [
+            'wmux pane new [--down] [--type T] [--color-scheme NAME]',
+            'wmux pane close <paneId> | focus <paneId> | list [--workspace <id>]',
+        ].join('\n'),
+        value: ['--type', '--color-scheme', '--workspace'],
+        bool: ['--down'],
+    },
+    'close-pane': { usage: 'wmux close-pane [paneId]' },
+    'focus-pane': { usage: 'wmux focus-pane <paneId>' },
+    'zoom-pane': { usage: 'wmux zoom-pane [paneId]' },
+    'list-panes': { usage: 'wmux list-panes [--workspace <workspaceId>]', value: ['--workspace'] },
+    tree: { usage: 'wmux tree [--workspace <workspaceId>]', value: ['--workspace'] },
+    // Layout
+    layout: {
+        usage: 'wmux layout grid --count <N> [--type T] [--anchor-surface <id>] [--anchor-pane <id>] [--workspace <id>]',
+        value: ['--count', '--type', '--anchor-surface', '--anchor-pane', '--workspace'],
+    },
+    // Terminal interaction
+    send: { usage: 'wmux send [--surface <id>] <text>', passthrough: true },
+    'send-key': {
+        usage: 'wmux send-key <key> [--ctrl] [--shift] [--alt] [--surface <id>]',
+        value: ['--surface'],
+        bool: ['--ctrl', '--shift', '--alt'],
+    },
+    'read-screen': {
+        usage: `wmux read-screen [--lines N] [--surface <id>]   ${SURFACE_NOTE}`,
+        value: ['--lines', '--surface'],
+    },
+    'trigger-flash': { usage: 'wmux trigger-flash [surfaceId]' },
+    'raw-v1': {
+        usage: 'wmux raw-v1 <command> [surfaceId] [args...]',
+        passthrough: true,
+    },
+    // Browser (free-form text for type/fill/eval)
+    browser: {
+        usage: [
+            'wmux browser open <url> | snapshot | click <ref> | type <ref> <text> | fill <ref> <value>',
+            'wmux browser screenshot [--full] | get-text [ref] | eval <js> | wait <ref> [ms]',
+            'wmux browser back | forward | reload',
+        ].join('\n'),
+        passthrough: true,
+    },
+    // Agent
+    agent: {
+        usage: [
+            'wmux agent spawn --cmd <C> [--label L] [--cwd D] [--pane P] [--workspace W] [--replace-tab]',
+            'wmux agent spawn-batch --json \'[...]\' [--strategy distribute|stack|split]',
+            'wmux agent status <agentId> | list [--workspace <id>] | kill <agentId>',
+        ].join('\n'),
+        value: ['--cmd', '--label', '--cwd', '--pane', '--workspace', '--json', '--strategy'],
+        bool: ['--replace-tab'],
+    },
+    // Markdown (--content takes free-form text)
+    markdown: {
+        usage: [
+            'wmux markdown <file>                                   (open a file in a new markdown view)',
+            'wmux markdown set <id> --content <text> [--title T]',
+            'wmux markdown set <id> --file <path>',
+            'wmux markdown get <id>',
+        ].join('\n'),
+        passthrough: true,
+    },
+    // Notifications
+    notify: { usage: 'wmux notify <text>', passthrough: true },
+    'list-notifications': { usage: 'wmux list-notifications' },
+    'clear-notifications': { usage: 'wmux clear-notifications [notificationId]' },
+    // Sidebar
+    'set-status': {
+        usage: [
+            'wmux set-status --workspace <id> --state <idle|running|interrupted> [--text "<label>"]',
+            'wmux set-status <key> <value>                          (legacy positional form)',
+        ].join('\n'),
+        value: ['--workspace', '--state', '--text'],
+    },
+    'set-progress': { usage: 'wmux set-progress <value> [--label L]', value: ['--label'] },
+    log: { usage: 'wmux log <level> <message>', passthrough: true },
+    'sidebar-state': { usage: 'wmux sidebar-state' },
+    diff: { usage: 'wmux diff [--file <path>]', value: ['--file'] },
+    hook: {
+        usage: 'wmux hook --event <type> --tool <name> [--agent <id>]',
+        value: ['--event', '--tool', '--agent'],
+    },
+    'agent-activity': {
+        usage: `wmux agent-activity [--tool T] [--skill S] [--done|--active] [--surface <id>]   ${SURFACE_NOTE}`,
+        value: ['--tool', '--skill', '--surface'],
+        bool: ['--done', '--active'],
+    },
+    // Declared agent state (issue #128)
+    'report-agent': {
+        usage: [
+            'wmux report-agent --blocked [reason] [--choices <json>] | --unblocked',
+            'wmux report-agent --run-start | --run-end | --run-depth <N>',
+            `  [--seq N] [--surface <id>]   ${SURFACE_NOTE}`,
+        ].join('\n'),
+        // --blocked's reason is optional; treating it as value-taking only ever
+        // skips one token that a later flag would have re-validated anyway.
+        value: ['--blocked', '--reason', '--choices', '--run-depth', '--seq', '--surface'],
+        bool: ['--unblocked', '--run-start', '--run-end'],
+    },
+    'report-metadata': {
+        usage: `wmux report-metadata [--model M] [--tokens T] [--context-pct N] [--ttl ms] [--seq N] [--surface <id>]   ${SURFACE_NOTE}`,
+        value: ['--model', '--tokens', '--context-pct', '--ttl', '--seq', '--surface'],
+    },
+    'report-session': {
+        usage: `wmux report-session <sessionId> [--seq N] [--surface <id>]   ${SURFACE_NOTE}`,
+        value: ['--session', '--seq', '--surface'],
+    },
+    'answer-agent': {
+        usage: 'wmux answer-agent --surface <id> --choice <choiceId>   (reply to ANOTHER pane; no ambient default)',
+        value: ['--surface', '--choice'],
+    },
+    'release-agent': {
+        usage: `wmux release-agent [--seq N] [--surface <id>]   ${SURFACE_NOTE}`,
+        value: ['--seq', '--surface'],
+    },
+    'agent-state': {
+        usage: 'wmux agent-state [--surface <id>]   (no --surface → every pane, plus the blocked list)',
+        value: ['--surface'],
+    },
+};
+/**
+ * Reject flags the command does not declare, instead of running with defaults.
+ *
+ * Only `--` flags are judged: single-dash tokens belong to passthrough commands
+ * (ssh options) and bare words are positional arguments.
+ */
+function checkFlags(command, args, spec) {
+    if (spec.passthrough)
+        return;
+    const takesValue = new Set(spec.value ?? []);
+    const standalone = new Set(spec.bool ?? []);
+    for (let i = 1; i < args.length; i++) {
+        const arg = args[i];
+        if (!arg.startsWith('--'))
+            continue;
+        if (standalone.has(arg))
+            continue;
+        if (takesValue.has(arg)) {
+            // A trailing value flag is the same silent default in a different
+            // costume: `getFlag` returns undefined and the command runs anyway.
+            // --blocked is the one flag whose value is genuinely optional.
+            if (i === args.length - 1 && arg !== '--blocked') {
+                fail(command, spec, `Flag '${arg}' needs a value.`);
+            }
+            i++;
+            continue;
+        }
+        fail(command, spec, `Unknown flag for '${command}': ${arg}`);
+    }
+}
+/** Print why the argv was rejected, then that command's usage, then exit 1. */
+function fail(command, spec, message) {
+    console.error(message);
+    console.error('');
+    console.error(spec.usage);
+    process.exit(1);
+}
+/** `wmux help [command]` — the only help route that works for passthrough commands. */
+function cmdHelp(args) {
+    const topic = args[1];
+    if (!topic) {
+        printUsage();
+        return;
+    }
+    const spec = COMMAND_SPECS[topic];
+    if (!spec) {
+        console.error(`Unknown command: ${topic}`);
+        printUsage();
+        process.exit(1);
+    }
+    console.log(spec.usage);
+}
 // Command dispatch table. Each handler receives the raw argv (args[0] is the
 // command name). Replaces a single giant switch so each command stays small and
-// independently testable.
+// independently testable. Typed against COMMAND_SPECS so the compiler — not a
+// bug report — catches a command that ships without usage text, or usage text
+// for a command that no longer exists.
 const COMMANDS = {
     // System
     ping: async () => console.log(await sendV1('ping')),
@@ -530,7 +999,10 @@ const COMMANDS = {
         print(await sendV2('surface.rename', { id, title }));
     },
     'focus-surface': async (args) => print(await sendV2('surface.focus', { id: args[1] })),
-    'list-surfaces': async (args) => print(await sendV2('surface.list', { paneId: getFlag(args, '--pane') })),
+    'list-surfaces': async (args) => print(await sendV2('surface.list', {
+        paneId: getFlag(args, '--pane'),
+        workspaceId: getFlag(args, '--workspace'),
+    })),
     'set-color-scheme': cmdSetColorScheme,
     'clear-color-scheme': async (args) => {
         const surfaceId = args[1] || process.env.WMUX_SURFACE_ID || '';
@@ -557,7 +1029,10 @@ const COMMANDS = {
     'focus-pane': async (args) => print(await sendV2('pane.focus', { id: args[1] })),
     'zoom-pane': async (args) => print(await sendV2('pane.zoom', { id: args[1] })),
     'list-panes': async (args) => print(await sendV2('pane.list', { workspaceId: getFlag(args, '--workspace') })),
-    tree: async () => print(await sendV2('system.tree')),
+    // `--workspace` used to be parsed by nobody: the flag was accepted on the
+    // command line and silently dropped here, so every call reported the ACTIVE
+    // workspace's tree whatever id you passed (issue #141).
+    tree: async (args) => print(await sendV2('system.tree', { workspaceId: getFlag(args, '--workspace') })),
     // Layout
     layout: cmdLayout,
     // Terminal interaction
@@ -618,6 +1093,7 @@ const COMMANDS = {
     'agent-activity': cmdAgentActivity,
     // Devcontainer support (issue #19)
     'raw-v1': cmdRawV1,
+    ...AGENT_STATE_COMMANDS,
 };
 async function main() {
     let args = process.argv.slice(2);
@@ -630,8 +1106,8 @@ async function main() {
     if (tokenOverride)
         PIPE_TOKEN = tokenOverride;
     const command = args[0];
-    if (!command) {
-        printUsage();
+    if (!command || command === 'help' || command === '--help' || command === '-h') {
+        cmdHelp(command === 'help' ? args : []);
         process.exit(0);
     }
     const handler = COMMANDS[command];
@@ -640,6 +1116,14 @@ async function main() {
         printUsage();
         process.exit(1);
     }
+    // Usage and flag checks both happen before a single byte reaches the pipe, so
+    // probing the CLI can no longer mutate the user's layout (issue #143).
+    const spec = COMMAND_SPECS[command];
+    if (!spec.passthrough && (args.includes('--help') || args.includes('-h'))) {
+        console.log(spec.usage);
+        process.exit(0);
+    }
+    checkFlags(command, args, spec);
     try {
         await handler(args);
     }
@@ -680,12 +1164,20 @@ Diff:       diff [--file <path>]
 Notify:     notify <text>, list-notifications, clear-notifications
 Sidebar:    set-status, set-progress, log, sidebar-state
 Hook:       hook --event <type> --tool <name> [--agent <id>]
+Agent state: report-agent --blocked [reason] [--choices <json>] | --unblocked
+            report-agent --run-start | --run-end
+            answer-agent --surface <id> --choice <id>   # reply without leaving your pane
+                          [--run-depth N] [--seq N] [--surface <id>]
+            report-metadata [--model M] [--tokens T] [--context-pct N] [--ttl ms]
+            report-session <id> | release-agent | agent-state [--surface <id>]
+            (surface defaults to $WMUX_SURFACE_ID — an agent in a pane needs no id)
 Config:     config show|reload|path   (edits ~/.wmux/config.toml — see docs)
             reload-config             (shorthand for 'config reload')
-Devcontainer support (issue #19):
-            raw-v1 <command> [surfaceId] [args...]   (send a raw V1 pipe command;
-            works over --remote/WMUX_REMOTE too, e.g. from inside a container
-            driving a wmux bridge on the host)
+
+Help:       wmux help <command>       (per-command usage; works for every command)
+            wmux <command> --help     (same, except for free-form commands such as
+                                       send / notify / log / ssh / browser / markdown,
+                                       where --help is part of the text you are sending)
 `);
 }
 main();

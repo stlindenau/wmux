@@ -4,9 +4,26 @@
 
 export WMUX=1
 
+# wmux CLI shortcut — Claude Code and users can just type: wmux browser open <url>
+wmux() { node "$WMUX_CLI" "$@"; }
+export -f wmux
+
 _wmux_report() {
     local msg="$1"
-    # Write to temp file for main process to pick up
+    # Devcontainer transport (issue #19): when WMUX_REMOTE is set (this shell
+    # can't reach a Windows named pipe or the host's Temp dir directly, e.g.
+    # running inside a Linux container driving a `wmux bridge` on the host —
+    # issue #78), relay the same V1 command line via `wmux raw-v1` instead of
+    # writing to the native message file. The `wmux` shim already resolves to
+    # `node "$WMUX_CLI"`, which transparently uses the TCP remote transport
+    # once WMUX_REMOTE/WMUX_REMOTE_TOKEN are set — no protocol duplication
+    # here. Fire-and-forget: backgrounded, output discarded, never blocks or
+    # fails the prompt on a slow/unreachable bridge.
+    if [ -n "${WMUX_REMOTE}" ] && command -v wmux &>/dev/null; then
+        ( wmux raw-v1 "$msg" >/dev/null 2>&1 & )
+        return
+    fi
+    # Native: write to temp file for the main process to pick up.
     local tmpdir="/mnt/c/Users/${USER}/AppData/Local/Temp/wmux"
     mkdir -p "$tmpdir" 2>/dev/null
     echo "$msg" >> "$tmpdir/messages"

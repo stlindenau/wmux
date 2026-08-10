@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 
+// Parts of this file are created by genAI.
+// This notice needs to remain attached to any reproduction of or excerpt from this file.
+// Agent: Claude Code
+// AI-assisted: Yes
+
 import net from 'net';
 import fs from 'fs';
 import os from 'os';
@@ -31,60 +36,34 @@ function parseRemoteTarget(spec: string): { host: string; port: number } {
   return { host: spec.slice(0, idx) || '127.0.0.1', port };
 }
 
-// ─── WSL2 transport (issue #xxx: devcontainer API transport) ─────────────────
+// ─── WSL2 transport: reach the Windows \\.\pipe\wmux from inside WSL2 ─────────
 //
-// WSL2 → Windows IPC: approached investigated, decision made.
+// A wmux CLI (or `wmux bridge`) running inside WSL2 needs to talk to the wmux
+// process on the Windows host over the \\.\pipe\wmux named pipe. AF_VSOCK,
+// TCP-over-gateway and cross-boundary Unix sockets were all evaluated and
+// rejected (HCS-managed WSL2 UVMs ignore GuestCommunicationServices; gateway
+// IPs/firewall policy are unreliable on corporate networks; 9P does not forward
+// AF_UNIX). The chosen mechanism is npiperelay.exe:
 //
-// GOAL: wmux CLI running inside a WSL2 devcontainer needs to talk to the wmux
-//       process on the Windows host over the \\.\pipe\wmux named pipe.
-//
-// OPTION A — AF_VSOCK (ideal, zero network, no deps):
-//   WSL2 exposes AF_VSOCK via the hv_sock driver (confirmed in dmesg).
-//   Windows registers services via HKLM\...\GuestCommunicationServices and
-//   listens on AF_HYPERV. In theory port 9787 maps to the service GUID
-//   {0000263b-facb-11e6-bd58-64006a7986d3}.
-//   BLOCKED: WSL2 runs as an HCS "VirtualMachine" with Owner="WSL" — a
-//   restricted UVM profile. GuestCommunicationServices registry entries are
-//   ignored for HCS-managed VMs. Dynamic registration via HcsModifyComputeSystem
-//   also fails (0x8037010D "invalid JSON document" for all device-addition
-//   schemas). WSL2 registers its own socket services (e.g. port 50000 for
-//   interop) through a proprietary code path in wslservice.exe at VM creation
-//   time, not via any public API. This approach requires reverse-engineering
-//   wslservice.exe and is not viable.
-//
-// OPTION B — TCP over WSL2 bridge gateway:
-//   wmux bridge --wsl binds on 0.0.0.0:9787. From WSL2, connect via the
-//   NAT gateway IP (172.x.x.x, read from /etc/resolv.conf).
-//   BLOCKED in corporate environment: gateway IP varies across Bosch network
-//   configurations; firewall policy prevents inbound connections to Windows.
-//   WSL2 mirrored networking (localhost works from both sides) requires
-//   networkingMode=mirrored in .wslconfig — policy prevents that change.
-//
-// OPTION C — Unix sockets:
-//   Windows AF_UNIX sockets (afunix.sys, Win10 1803+) cannot be accessed from
-//   WSL2 via /mnt/c/... — the 9P filesystem driver does not forward socket ops.
-//   Unix sockets inside the WSL2 Linux filesystem (/tmp/...) are inaccessible
-//   from the Windows side. Cross-boundary Unix sockets don't work in WSL2.
-//
-// CHOSEN: named pipe + npiperelay.exe (Option D)
-//   npiperelay.exe is a tiny (~2MB) open-source Windows binary that reads a
-//   named pipe and forwards it to its own stdin/stdout. WSL2 can execute Windows
-//   binaries via interop, so from inside WSL2 we spawn npiperelay.exe and use
-//   its stdio as the transport duplex — zero pre-setup, no socat needed.
-//   Security: the binary is verified by SHA-256 before first use (see
-//   src/vsock-tests/wsl-npiperelay-setup.sh for the download/verify helper).
+//   npiperelay.exe is a tiny (~2MB) open-source Windows binary that forwards a
+//   named pipe to its own stdin/stdout. WSL2 executes Windows binaries via
+//   interop, so from inside WSL2 we spawn it and use its stdio as the transport
+//   duplex — zero pre-setup, no socat needed. Install it (SHA-256 pinned) with
+//   scripts/install-npiperelay.sh; see resources/wmux-orchestrator/docs/DEVCONTAINER.md.
 //   Source: https://github.com/albertony/npiperelay (MIT, fork of jstarks/npiperelay)
 //   Pinned version: v1.11.4  SHA-256: cea82cf5c9c22a28bef8075750acb7958f766393baebff4597cf21442f71c4b3
 //
-//   Transport selection order inside WSL2:
-//     1. WMUX_PIPE starts with '/' → use as Unix socket (manual pre-setup, socat)
+//   Transport selection order (connectTransport, below):
+//     0. remoteTarget set (--remote / WMUX_REMOTE) → TCP (the devcontainer path,
+//        served by a `wmux bridge` reachable at host.docker.internal:9787)
+//     1. WMUX_PIPE starts with '/' → use as a Unix socket path
 //     2. WSL_DISTRO_NAME / WSLENV set → spawn npiperelay.exe automatically
-//     3. Windows: connect directly to the named pipe
+//     3. native Windows → connect directly to the named pipe
 // ─────────────────────────────────────────────────────────────────────────────
 function connectTransport(onConnect: () => void): net.Socket | Duplex {
   if (remoteTarget)
     return net.connect({ host: remoteTarget.host, port: remoteTarget.port }, onConnect);
-  // WMUX_PIPE pointing at a Unix socket (pre-setup by wsl-npiperelay-setup.sh or similar)
+  // WMUX_PIPE pointing at a Unix socket path
   if (PIPE_PATH.startsWith('/'))
     return net.connect({ path: PIPE_PATH }, onConnect);
   // Inside WSL2: relay through npiperelay.exe (Windows binary, called via interop)
@@ -430,7 +409,12 @@ async function cmdBridge(args: string[]): Promise<void> {
     console.warn(`Prefer the default 127.0.0.1 + an SSH tunnel: ssh -L ${port}:127.0.0.1:${port} user@host`);
   }
   const server = net.createServer((sock) => {
-    const pipe = net.connect({ path: PIPE_PATH });
+    // Connect to the local wmux via the same transport selector the CLI uses.
+    // In the bridge process remoteTarget is always null, so this resolves to:
+    // Unix socket (WMUX_PIPE=/path) → npiperelay.exe (inside WSL2) → the named
+    // pipe directly (native Windows). This is what lets `wmux bridge` run from
+    // inside WSL2 and still reach the Windows-host pipe over interop.
+    const pipe = connectTransport(() => {});
     sock.pipe(pipe);
     pipe.pipe(sock);
     const drop = () => { sock.destroy(); pipe.destroy(); };
@@ -695,6 +679,7 @@ const COMMAND_SPECS = {
   bridge: {
     usage: 'wmux bridge [--port P] [--host H] [--wsl]   (expose this wmux\'s pipe over TCP; --wsl binds 0.0.0.0 for WSL2 access)',
     value: ['--port', '--host'],
+    bool: ['--wsl'],
   },
   token: { usage: 'wmux token   (print this instance\'s pipe auth token)' },
 
