@@ -34,6 +34,12 @@ if (argv[0] === '--event') {
 }
 else {
     tool = argv[0] || 'unknown';
+    // PostToolUse is registered positionally (`wmux-hook.js <tool>`), so it
+    // carries no --event. The main-process receiver gates the declared
+    // agent-state update on `surfaceId && event` (index.ts handleHookEvent), so
+    // without an event PostToolUse never maps to runDepth:1 ("working"). Set it
+    // here so the sidebar's run state lights up while a turn is in flight.
+    event = 'PostToolUse';
 }
 const DEFAULT_BRIDGE_PORT = 9787;
 const pipePath = process.env.WMUX_PIPE || '\\\\.\\pipe\\wmux';

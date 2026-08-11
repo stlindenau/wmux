@@ -68,7 +68,9 @@ describe('wmux-hook.js TCP remote-mode transport (issue #19)', () => {
     const req = await server.requests;
     expect(req.method).toBe('hook.event');
     expect(req.token).toBe('secret-token');
-    expect(req.params).toEqual({ tool: 'Bash', surfaceId: 'pane-1' });
+    // PostToolUse is invoked positionally and now also carries event so the
+    // main-process receiver's `surfaceId && event` gate passes (runDepth:1).
+    expect(req.params).toEqual({ tool: 'Bash', event: 'PostToolUse', surfaceId: 'pane-1' });
   });
 
   it('includes file_path from PostToolUse Edit/Write stdin payloads', async () => {
@@ -82,7 +84,7 @@ describe('wmux-hook.js TCP remote-mode transport (issue #19)', () => {
     );
 
     const req = await server.requests;
-    expect(req.params).toEqual({ tool: 'Edit', file: '/workspaces/repo/foo.ts', surfaceId: 'pane-2' });
+    expect(req.params).toEqual({ tool: 'Edit', event: 'PostToolUse', file: '/workspaces/repo/foo.ts', surfaceId: 'pane-2' });
   });
 
   it('sends the --event flag as the event field for Notification/Stop', async () => {
