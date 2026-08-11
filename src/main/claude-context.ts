@@ -149,8 +149,17 @@ function getCliAbsolutePath(): string {
   return path.resolve(path.join(__dirname, '../cli/wmux.js'));
 }
 
-/** Tools tracked via PostToolUse hooks for the sidebar/diff view. */
-const TRACKED_TOOLS = ['Bash', 'Read', 'Write', 'Edit', 'Grep', 'Glob', 'Agent', 'WebSearch', 'WebFetch', 'Skill'];
+/**
+ * Tools tracked via PostToolUse hooks for the sidebar/diff view.
+ *
+ * AskUserQuestion and ExitPlanMode are the two tools that park the agent on a
+ * human without going through a permission prompt, so they are the ones whose
+ * completion proves the human answered.
+ */
+const TRACKED_TOOLS = [
+  'Bash', 'Read', 'Write', 'Edit', 'Grep', 'Glob', 'Agent', 'WebSearch', 'WebFetch', 'Skill',
+  'AskUserQuestion', 'ExitPlanMode',
+];
 
 /** Drop any wmux entry from one hook array, preserving the user's own hooks. */
 const stripWmux = (entries: any): any[] =>
@@ -160,7 +169,38 @@ const stripWmux = (entries: any): any[] =>
   });
 
 /** The hook arrays wmux installs into, and therefore the ones it may remove from. */
-const WMUX_HOOK_EVENTS = ['PostToolUse', 'Notification', 'Stop', 'SubagentStop'] as const;
+const WMUX_HOOK_EVENTS = [
+  'PermissionRequest',
+  'PermissionDenied',
+  'PostToolUse',
+  'Notification',
+  'UserPromptSubmit',
+  'SubagentStart',
+  'SubagentStop',
+  'Stop',
+  'SessionEnd',
+] as const;
+
+/** Events registered with a bare `--event <Name>` and no matcher. */
+const WMUX_EVENT_HOOKS: { event: string; why: string }[] = [
+  // The precise "about to park on a human" edge — fires before the permission
+  // prompt is shown and names the tool, so PostToolUse for that same tool is
+  // what unblocks the pane again.
+  { event: 'PermissionRequest', why: 'permission prompt about to be shown' },
+  // The deny half. Without it the deny path stays blocked until Stop.
+  { event: 'PermissionDenied', why: 'the human refused the permission' },
+  // Claude Code is asking for input/permission, or nudging after ~60s idle.
+  { event: 'Notification', why: 'agent wants the user' },
+  // The human answered — clears any block, whatever set it.
+  { event: 'UserPromptSubmit', why: 'the human answered' },
+  // Refcount edges for parallel subagents sharing one surface.
+  { event: 'SubagentStart', why: 'a parallel subagent began' },
+  { event: 'SubagentStop', why: 'a parallel subagent finished' },
+  // Claude Code finished its turn and is back at the prompt.
+  { event: 'Stop', why: 'the turn is over' },
+  // Claude Code exited — the pane's declared state must be dropped, not kept.
+  { event: 'SessionEnd', why: 'the agent is gone' },
+];
 
 /**
  * Inverse of {@link applyWmuxHooks}: returns a settings object with every wmux
@@ -189,8 +229,8 @@ export function removeWmuxHooks(settings: any): any {
 /**
  * Pure builder for the wmux hook blocks. Given the parsed settings object and
  * the absolute path to wmux-hook.js, returns a new settings object whose
- * `hooks` contains fresh wmux PostToolUse/Notification/Stop/SubagentStop
- * entries, with any prior wmux entries replaced and all non-wmux (user) hooks
+ * `hooks` contains a fresh wmux entry for every event in WMUX_HOOK_EVENTS,
+ * with any prior wmux entries replaced and all non-wmux (user) hooks
  * preserved. Extracted so the merge logic is unit-testable without touching
  * the fs (issue #53).
  */
@@ -212,33 +252,29 @@ export function applyWmuxHooks(settings: any, hookScript: string): any {
     })),
   ];
 
-  // Notification — Claude Code is asking for input/permission (waiting on you).
-  next.hooks.Notification = [
-    ...stripWmux(next.hooks.Notification),
-    { hooks: [{ type: 'command', command: makeEventCmd('Notification') }] },
-  ];
-
-  // Stop — Claude Code finished its turn and is back at the prompt.
-  next.hooks.Stop = [
-    ...stripWmux(next.hooks.Stop),
-    { hooks: [{ type: 'command', command: makeEventCmd('Stop') }] },
-  ];
-
-  // SubagentStop — one parallel subagent finished (drives sidebar agent lines).
-  next.hooks.SubagentStop = [
-    ...stripWmux(next.hooks.SubagentStop),
-    { hooks: [{ type: 'command', command: makeEventCmd('SubagentStop') }] },
-  ];
+  // Everything else is an unmatched --event hook; see WMUX_EVENT_HOOKS above
+  // for what each one is for.
+  for (const { event } of WMUX_EVENT_HOOKS) {
+    next.hooks[event] = [
+      ...stripWmux(next.hooks[event]),
+      { hooks: [{ type: 'command', command: makeEventCmd(event) }] },
+    ];
+  }
 
   return next;
 }
 
 /**
  * Ensures Claude Code's ~/.claude/settings.json has the wmux hooks:
- *  - PostToolUse   → drives the sidebar/diff view (tool activity)
- *  - Notification  → fires a wmux notification when the agent needs input/permission
- *  - Stop          → fires a wmux notification when the agent finishes its turn
- *  - SubagentStop  → fires when one parallel subagent finishes (sidebar agent lines)
+ *  - PostToolUse      → drives the sidebar/diff view (tool activity)
+ *  - PermissionRequest→ parks the pane; names the tool being asked about
+ *  - PermissionDenied → the human refused; the pane resumes
+ *  - Notification     → fires a wmux notification when the agent needs input
+ *  - UserPromptSubmit → the human answered; clears any block
+ *  - SubagentStart    → one parallel subagent began (run refcount +1)
+ *  - SubagentStop     → one parallel subagent finished (sidebar agent lines)
+ *  - Stop             → fires a wmux notification when the agent finishes its turn
+ *  - SessionEnd       → Claude Code exited; the pane's declared state is dropped
  * Uses absolute CLI paths (not env var). Never touches non-wmux hook entries
  * (issue #53): existing user hooks in each array are preserved.
  */

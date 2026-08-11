@@ -404,7 +404,9 @@ function applyHookLifecycle(params: any): void {
   const sid = params?.surfaceId as SurfaceId | undefined;
   if (!sid) return;
   if (params.event === 'SubagentStop') markSubagentStop(sid);
-  else if (params.event === 'Stop') markAllAgentsDone(sid);
+  // SessionEnd is Stop's stronger sibling: Claude Code is gone, so every agent
+  // line the pane was showing is finished by definition, not just this turn's.
+  else if (params.event === 'Stop' || params.event === 'SessionEnd') markAllAgentsDone(sid);
 }
 
 /** Edit/Write hooks refresh the diff view; delays let the DiffPane mount first. */
@@ -434,7 +436,17 @@ function handleHookEvent(params: any): void {
     // that overtook a newer one on the wire — e.g. a trailing PostToolUse
     // arriving after Stop, which would otherwise re-pin the pane to "working".
     const seq = typeof params.seq === 'number' ? params.seq : undefined;
-    applyHookToAgentState(params.surfaceId as SurfaceId, String(params.event), params.message ?? null, seq);
+    // `tool` scopes PermissionRequest → PostToolUse: the pane unblocks when the
+    // very tool it was parked on runs (the human allowed it), not when some
+    // parallel subagent's unrelated tool happens to finish.
+    const tool = typeof params.tool === 'string' ? params.tool : null;
+    applyHookToAgentState(
+      params.surfaceId as SurfaceId,
+      String(params.event),
+      params.message ?? null,
+      seq,
+      tool,
+    );
   }
 
   // Always refresh the diff for Edit/Write, even without a file path.

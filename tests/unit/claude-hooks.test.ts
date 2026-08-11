@@ -67,4 +67,41 @@ describe('applyWmuxHooks (issue #53)', () => {
     const twice = applyWmuxHooks(once, '/abs/wmux-hook.js');
     expect(twice.hooks.SubagentStop).toHaveLength(1);
   });
+
+  it('registers the whole agent-state lifecycle, not just tool activity', () => {
+    // Each of these is load-bearing for the sidebar's blocked/working/idle
+    // model; a missing one degrades silently, because every hook command ends
+    // in `2>/dev/null || true`.
+    const out = applyWmuxHooks({}, HOOK);
+    for (const event of [
+      'PermissionRequest',
+      'PermissionDenied',
+      'Notification',
+      'UserPromptSubmit',
+      'SubagentStart',
+      'SubagentStop',
+      'Stop',
+      'SessionEnd',
+    ]) {
+      expect(wmuxCmds(out.hooks[event]), event).toEqual([
+        `node "${HOOK}" --event ${event} 2>/dev/null || true`,
+      ]);
+    }
+  });
+
+  it('tracks the tools that park the agent on a human', () => {
+    // Without these two the only "pending" signal is Notification, which does
+    // not fire for either of them.
+    const postCmds = wmuxCmds(applyWmuxHooks({}, HOOK).hooks.PostToolUse);
+    expect(postCmds.some((c) => c.includes('AskUserQuestion'))).toBe(true);
+    expect(postCmds.some((c) => c.includes('ExitPlanMode'))).toBe(true);
+  });
+
+  it('is idempotent across every registered event', () => {
+    const once = applyWmuxHooks({}, HOOK);
+    const twice = applyWmuxHooks(once, HOOK);
+    for (const event of Object.keys(twice.hooks)) {
+      expect(twice.hooks[event], event).toHaveLength(once.hooks[event].length);
+    }
+  });
 });
