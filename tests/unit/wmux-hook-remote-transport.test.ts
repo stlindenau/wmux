@@ -70,7 +70,10 @@ describe('wmux-hook.js TCP remote-mode transport (issue #19)', () => {
     expect(req.token).toBe('secret-token');
     // PostToolUse is invoked positionally and now also carries event so the
     // main-process receiver's `surfaceId && event` gate passes (runDepth:1).
-    expect(req.params).toEqual({ tool: 'Bash', event: 'PostToolUse', surfaceId: 'pane-1' });
+    // Every frame also carries a send-time microsecond seq so the receiver can
+    // order racing frames from separate hook processes (fixes stuck "working").
+    expect(req.params).toEqual({ tool: 'Bash', event: 'PostToolUse', surfaceId: 'pane-1', seq: expect.any(Number) });
+    expect(req.params.seq).toBeGreaterThan(0);
   });
 
   it('includes file_path from PostToolUse Edit/Write stdin payloads', async () => {
@@ -84,7 +87,7 @@ describe('wmux-hook.js TCP remote-mode transport (issue #19)', () => {
     );
 
     const req = await server.requests;
-    expect(req.params).toEqual({ tool: 'Edit', event: 'PostToolUse', file: '/workspaces/repo/foo.ts', surfaceId: 'pane-2' });
+    expect(req.params).toEqual({ tool: 'Edit', event: 'PostToolUse', file: '/workspaces/repo/foo.ts', surfaceId: 'pane-2', seq: expect.any(Number) });
   });
 
   it('sends the --event flag as the event field for Notification/Stop', async () => {
@@ -98,7 +101,39 @@ describe('wmux-hook.js TCP remote-mode transport (issue #19)', () => {
     );
 
     const req = await server.requests;
-    expect(req.params).toEqual({ event: 'Notification', message: 'Permission needed' });
+    expect(req.params).toEqual({ event: 'Notification', message: 'Permission needed', seq: expect.any(Number) });
+  });
+
+  it('stamps a strictly increasing seq across separate hook processes', async () => {
+    // Two hooks fired back-to-back are two processes; their seq must order by
+    // send time so a later Stop always outranks an earlier PostToolUse even if
+    // the packets reorder in flight.
+    const captured: any[] = [];
+    let resolveTwo: () => void;
+    const gotTwo = new Promise<void>((r) => { resolveTwo = r; });
+    const server = net.createServer((socket) => {
+      let data = '';
+      socket.on('data', (chunk) => {
+        data += chunk.toString();
+        if (data.includes('\n')) {
+          captured.push(JSON.parse(data.trim()));
+          socket.end();
+          if (captured.length === 2) resolveTwo();
+        }
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    const addr = server.address();
+    const port = typeof addr === 'object' && addr ? addr.port : 0;
+    close = () => new Promise((r) => server.close(() => r()));
+
+    const env = { ...process.env, WMUX_REMOTE: `127.0.0.1:${port}`, WMUX_REMOTE_TOKEN: 't', WMUX_SURFACE_ID: 'pane-seq' } as Record<string, string>;
+    await runHook(['Bash'], env);
+    await runHook(['--event', 'Stop'], env);
+    await gotTwo;
+
+    expect(captured).toHaveLength(2);
+    expect(captured[1].params.seq).toBeGreaterThan(captured[0].params.seq);
   });
 
   it('defaults to port 9787 when WMUX_REMOTE has no explicit port', async () => {

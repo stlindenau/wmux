@@ -430,7 +430,11 @@ function handleHookEvent(params: any): void {
   // is what makes "which pane is parked on me?" work for Claude Code with no
   // plugin to install — wmux already registers these hooks.
   if (params?.surfaceId && params?.event) {
-    applyHookToAgentState(params.surfaceId as SurfaceId, String(params.event), params.message ?? null);
+    // seq (when the hook client stamps it) lets acceptSeq drop a stale frame
+    // that overtook a newer one on the wire — e.g. a trailing PostToolUse
+    // arriving after Stop, which would otherwise re-pin the pane to "working".
+    const seq = typeof params.seq === 'number' ? params.seq : undefined;
+    applyHookToAgentState(params.surfaceId as SurfaceId, String(params.event), params.message ?? null, seq);
   }
 
   // Always refresh the diff for Edit/Write, even without a file path.

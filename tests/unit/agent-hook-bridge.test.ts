@@ -36,6 +36,20 @@ describe('hookToAgentReport', () => {
   it('Stop is decisive: nothing running, nothing waiting', () => {
     expect(hookToAgentReport('Stop', null)).toEqual({ awaitingHuman: false, runDepth: 0 });
   });
+
+  it('omits seq when the hook client did not stamp one (back-compat)', () => {
+    // An older client sends no seq; the payload must stay exactly as before so
+    // acceptSeq opts out and every frame is applied in arrival order.
+    expect(hookToAgentReport('PostToolUse', null)).toEqual({ awaitingHuman: false, runDepth: 1 });
+    expect(hookToAgentReport('PostToolUse', null)).not.toHaveProperty('seq');
+  });
+
+  it('forwards a stamped seq onto every event payload', () => {
+    expect(hookToAgentReport('PostToolUse', null, 42)).toEqual({ awaitingHuman: false, runDepth: 1, seq: 42 });
+    expect(hookToAgentReport('Stop', null, 43)).toEqual({ awaitingHuman: false, runDepth: 0, seq: 43 });
+    expect(hookToAgentReport('Notification', 'permission', 44)).toEqual({ awaitingHuman: true, reason: 'permission', seq: 44 });
+    expect(hookToAgentReport('SubagentStop', null, 45)).toEqual({ runDelta: -1, seq: 45 });
+  });
 });
 
 describe('applyHookToAgentState', () => {
@@ -71,6 +85,19 @@ describe('applyHookToAgentState', () => {
     applyHookToAgentState(surf, 'Notification', 'waiting');
     applyHookToAgentState(surf, 'Stop', null);
     expect(getAgentState(surf)).toMatchObject({ state: 'idle', blockedReason: null });
+  });
+
+  it('a stale PostToolUse that overtook Stop on the wire cannot re-pin "working"', () => {
+    // The stuck-on-"working" bug: each hook is its own process over its own
+    // connection, so a trailing PostToolUse can arrive AFTER Stop. With a
+    // send-time seq, Stop (stamped later) wins even when it is applied first —
+    // the older PostToolUse is dropped by acceptSeq and the pane stays idle.
+    applyHookToAgentState(surf, 'PostToolUse', null, 1000);
+    applyHookToAgentState(surf, 'Stop', null, 2000);          // sent last, applied here
+    expect(getAgentState(surf)?.state).toBe('idle');
+
+    applyHookToAgentState(surf, 'PostToolUse', null, 1500);   // older frame, arrives late
+    expect(getAgentState(surf)?.state).toBe('idle');          // rejected — no ghost "working"
   });
 
   it('a subagent finishing does not end the outer turn', () => {

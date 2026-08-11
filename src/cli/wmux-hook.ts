@@ -21,6 +21,7 @@
  * WMUX_REMOTE_TOKEN this script already reads either way.
  */
 import net from 'net';
+import { performance } from 'perf_hooks';
 
 const argv = process.argv.slice(2);
 let tool = '';
@@ -85,12 +86,27 @@ function sendHook(): void {
     // stdin wasn't valid JSON — that's fine.
   }
 
-  const params: Record<string, string> = {};
+  const params: Record<string, string | number> = {};
   if (event) params.event = event;
   if (tool) params.tool = tool;
   if (file) params.file = file;
   if (message) params.message = message;
   if (surfaceId) params.surfaceId = surfaceId;
+
+  // Each hook runs as its own short-lived process and opens its own connection
+  // to wmux, so the frames race: TCP only orders bytes WITHIN one connection.
+  // Without a sequence number the receiver has no way to tell that a `Stop`
+  // (turn over → runDepth 0) is newer than a trailing `PostToolUse` (runDepth 1)
+  // that overtook it on the wire, and the pane stays stuck on "working" until
+  // the next turn. Stamp every frame with a wall-clock-anchored microsecond
+  // `seq` — comparable across processes because performance.timeOrigin anchors
+  // performance.now() to the same wall clock — so the receiver's monotonic seq
+  // gate (acceptSeq in agent-state.ts) applies frames in send order regardless
+  // of arrival order. µs resolution makes a collision between two distinct hook
+  // fires effectively impossible. It travels inside `params` because that is the
+  // object handleHookEvent receives (index.ts passes request.params, not the
+  // whole message).
+  params.seq = Math.round((performance.timeOrigin + performance.now()) * 1000);
 
   const client = connectTransport(() => {
     const msg = JSON.stringify({ method: 'hook.event', params, id: 1, token });

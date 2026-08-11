@@ -28,11 +28,20 @@ export type ClaudeHookEvent = 'PostToolUse' | 'Notification' | 'Stop' | 'Subagen
 
 /**
  * Map one Claude Code hook event to a report_agent payload, or null to ignore it.
+ *
+ * `seq`, when the hook client stamps it, rides along on every payload so
+ * reportAgent's monotonic gate (acceptSeq) can reject a frame that overtook a
+ * newer one on the wire. Each hook fires as its own process over its own
+ * connection, so without this a trailing PostToolUse landing after Stop would
+ * re-assert runDepth:1 and strand the pane on "working".
  */
 export function hookToAgentReport(
   event: ClaudeHookEvent,
   message: string | null,
+  seq?: number,
 ): ReportAgentParams | null {
+  const withSeq = (params: ReportAgentParams): ReportAgentParams =>
+    seq === undefined ? params : { ...params, seq };
   switch (event) {
     // Claude Code wants the user. This fires both for permission/question
     // prompts and for the ~60s "still waiting on you" idle nudge, and we park
@@ -42,7 +51,7 @@ export function hookToAgentReport(
     // stop working the day Claude Code rewords a prompt, and the failure would
     // be the dangerous direction (a real prompt read as "not blocked").
     case 'Notification':
-      return { awaitingHuman: true, reason: message };
+      return withSeq({ awaitingHuman: true, reason: message });
 
     // A tool finished, so a turn is in flight — and nobody is parked on a
     // prompt, because a pending permission dialog would have stopped the tool
@@ -53,14 +62,14 @@ export function hookToAgentReport(
     // absolute value is idempotent — five hundred tool calls still leave the
     // depth at 1.
     case 'PostToolUse':
-      return { awaitingHuman: false, runDepth: 1 };
+      return withSeq({ awaitingHuman: false, runDepth: 1 });
 
     // One parallel subagent finished. The outer turn normally continues, so
     // this decrements rather than clearing — that is the whole reason runDepth
     // is a refcount. reportAgent clamps at zero, so an unbalanced decrement
     // (a subagent whose start we never saw) cannot go negative.
     case 'SubagentStop':
-      return { runDelta: -1 };
+      return withSeq({ runDelta: -1 });
 
     // The turn is over: nothing can still be running and nothing can still be
     // waiting on the user. Decisive on purpose — this is the backstop that
@@ -68,7 +77,7 @@ export function hookToAgentReport(
     // dropped, the same role Stop already plays for the sidebar's agent lines
     // (issue #81 class).
     case 'Stop':
-      return { awaitingHuman: false, runDepth: 0 };
+      return withSeq({ awaitingHuman: false, runDepth: 0 });
 
     default:
       return null;
@@ -83,11 +92,12 @@ export function applyHookToAgentState(
   surfaceId: SurfaceId,
   event: string,
   message: string | null,
+  seq?: number,
 ): void {
   const known: ClaudeHookEvent[] = ['PostToolUse', 'Notification', 'Stop', 'SubagentStop'];
   if (!known.includes(event as ClaudeHookEvent)) return;
 
-  const params = hookToAgentReport(event as ClaudeHookEvent, message);
+  const params = hookToAgentReport(event as ClaudeHookEvent, message, seq);
   if (!params) return;
   reportAgent(surfaceId, params);
 }
