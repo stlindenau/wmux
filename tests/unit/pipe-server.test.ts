@@ -59,6 +59,40 @@ describe('PipeServer', () => {
     expect(commands[0].args).toEqual(['C:\\Users\\test']);
   });
 
+  it('keeps report_startup_command as one free-text argument', async () => {
+    const pipe = uniquePipe();
+    server = new PipeServer(pipe, 'test-token');
+    const commands: any[] = [];
+    server.on('v1', (cmd) => commands.push(cmd));
+    server.start();
+    await new Promise(r => setTimeout(r, 200));
+
+    const response = await connectAndSend(
+      pipe,
+      'auth test-token report_startup_command surf-123 bash .devcontainer/launch.sh --detach'
+    );
+    expect(response).toBe('ok');
+    expect(commands.length).toBe(1);
+    expect(commands[0].command).toBe('report_startup_command');
+    expect(commands[0].surfaceId).toBe('surf-123');
+    expect(commands[0].args).toEqual(['bash .devcontainer/launch.sh --detach']);
+  });
+
+  it('treats an argument-less report_startup_command as a clear', async () => {
+    const pipe = uniquePipe();
+    server = new PipeServer(pipe, 'test-token');
+    const commands: any[] = [];
+    server.on('v1', (cmd) => commands.push(cmd));
+    server.start();
+    await new Promise(r => setTimeout(r, 200));
+
+    const response = await connectAndSend(pipe, 'auth test-token report_startup_command surf-123');
+    expect(response).toBe('ok');
+    expect(commands.length).toBe(1);
+    expect(commands[0].surfaceId).toBe('surf-123');
+    expect(commands[0].args).toEqual([]);
+  });
+
   it('rejects V1 state updates without a token', async () => {
     const pipe = uniquePipe();
     server = new PipeServer(pipe, 'secret');

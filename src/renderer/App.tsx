@@ -302,6 +302,22 @@ function handleSurfaceMetadata(cmd: any, ws: WorkspaceInfo, deps: MetaDeps): voi
       }
       break;
     }
+    case 'report_startup_command': {
+      // A shell can declare how to bring its surface back after a restart —
+      // e.g. a devcontainer shell reports the launcher that re-enters it, so a
+      // restored pane starts in WSL and runs it. No argument clears it.
+      if (!cmd.surfaceId) break;
+      const command = cmd.args?.[0];
+      const { updateSurface } = useStore.getState();
+      for (const paneId of getAllPaneIds(ws.splitTree)) {
+        const leaf = findLeaf(ws.splitTree, paneId);
+        if (leaf?.surfaces.some((s) => s.id === cmd.surfaceId)) {
+          updateSurface(ws.id, paneId, cmd.surfaceId, { startupCommands: command ? [command] : undefined });
+          break;
+        }
+      }
+      break;
+    }
     case 'report_git_branch':
       deps.updateWorkspaceMetadata(ws.id, { gitBranch: cmd.args?.[0], gitDirty: cmd.args?.[1] === 'dirty' });
       break;

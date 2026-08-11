@@ -345,6 +345,7 @@ Connect to `\\.\pipe\wmux` for programmatic control. Two protocols supported:
 report_pwd <surface_id> <path>
 report_git_branch <surface_id> <branch> [dirty]
 report_shell_state <surface_id> idle|running|interrupted
+report_startup_command <surface_id> [command...]   # replay after session restore; no command = clear
 notify <surface_id> <text>
 ping
 ```

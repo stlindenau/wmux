@@ -133,6 +133,10 @@ export class PipeServer extends EventEmitter {
     switch (command) {
       case 'report_pwd':
       case 'notify':
+      // report_startup_command: the whole command line is one argument (it
+      // almost always contains spaces), and an empty argument list is valid —
+      // it means "clear the surface's startup command".
+      case 'report_startup_command':
         // Single free-text argument — may contain spaces (issue #53).
         args = argsRaw ? [argsRaw] : [];
         break;
