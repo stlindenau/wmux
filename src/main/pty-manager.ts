@@ -130,6 +130,39 @@ function isPosixPath(p: string): boolean {
   return p.startsWith('/') && !p.startsWith('//');
 }
 
+// The two environment facts resolveShellForCwd depends on, behind an object so
+// a test can substitute them without pretending to be Windows. `hasWsl` is
+// cached because it shells out to `where`, and this runs on every pane create.
+let cachedWsl: boolean | null = null;
+export const shellEnv = {
+  isWindows: (): boolean => process.platform === 'win32',
+  hasWsl: (): boolean => {
+    if (cachedWsl === null) cachedWsl = isShellAvailable('wsl.exe');
+    return cachedWsl;
+  },
+};
+
+// A pane whose cwd is a POSIX/WSL path (the common case once a WSL or
+// devcontainer shell has reported its directory via report_pwd) cannot be
+// served by a Win32 shell: resolveSpawnCwd() below has no choice but to hand
+// pwsh/cmd %USERPROFILE%, so a new tab or split silently lands in the Windows
+// home folder instead of the project. Translating to \\wsl.localhost\... is not
+// an option either — CreateProcess rejects a UNC working directory.
+//
+// wsl.exe is the one shell that CAN open that path (buildShellArgs passes it as
+// --cd), so substitute it. Only the two shells that are physically incapable of
+// the directory are replaced: an 'unknown' spec is left alone because it may be
+// a deliberate remote command line such as `ssh user@host` (issue #78).
+export function resolveShellForCwd(shell: string, cwd: string | undefined): string {
+  if (!shellEnv.isWindows()) return shell;
+  if (!cwd || !isPosixPath(cwd)) return shell;
+  const shellType = getShellType(shell);
+  if (shellType !== 'powershell' && shellType !== 'cmd') return shell;
+  if (!shellEnv.hasWsl()) return shell;
+  console.warn(`[wmux] cwd is a POSIX path, using wsl.exe instead of ${shell}: ${cwd}`);
+  return 'wsl.exe';
+}
+
 // Resolve the working dir handed to pty.spawn, guaranteeing it is a directory
 // that exists — otherwise CreateProcess fails with error 267 (ERROR_DIRECTORY)
 // and the pane dies with an opaque "Cannot create process, error code: 267".
@@ -299,7 +332,9 @@ export class PtyManager {
     // Extra args only apply when the REQUESTED executable resolved — if we fell
     // back to the default shell, its command line must not inherit ssh's args.
     const spec = parseShellSpec(options.shell);
-    const shell = resolveShell(spec.command);
+    // A POSIX cwd forces wsl.exe — pwsh/cmd cannot open that directory at all
+    // and would silently start in %USERPROFILE% instead of the project.
+    const shell = resolveShellForCwd(resolveShell(spec.command), options.cwd);
     const shellExtraArgs = shell === spec.command ? spec.args : [];
     const shellType = getShellType(shell);
     const integrationDir = getShellIntegrationPath();
