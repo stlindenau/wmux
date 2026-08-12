@@ -6,16 +6,18 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 /**
  * wmux hook helper — sends a hook event to wmux.
- * Called by Claude Code hooks (PostToolUse, Notification, Stop, SubagentStop).
+ * Called by Claude Code hooks (PermissionRequest, PermissionDenied, PostToolUse,
+ * Notification, UserPromptSubmit, SubagentStart, SubagentStop, Stop, SessionEnd).
  *
  * Usage:
  *   node wmux-hook.js <tool-name>        # PostToolUse — sidebar/diff tracking
  *   node wmux-hook.js --event <Event>    # Notification/Stop fire a wmux notification;
- *                                        # Stop/SubagentStop also drive sidebar agent lifecycle
+ *                                        # the rest drive sidebar agent lifecycle
  *
  * Reads stdin for the Claude Code hook payload (JSON):
  *   - PostToolUse Edit/Write → extracts tool_input.file_path
  *   - Notification           → extracts the `message` (what the agent is waiting for)
+ *   - tool-scoped events     → extracts `tool_name`
  * WMUX_SURFACE_ID (set by wmux in each pane's shell) ties the event to its pane.
  *
  * Transport: connects to the named pipe (WMUX_PIPE) by default. When
@@ -83,6 +85,14 @@ function sendHook() {
                 || '';
             // The Notification hook payload carries the prompt text in `message`.
             message = data.message || '';
+            // PermissionRequest/PermissionDenied are registered with --event, so the
+            // tool they concern only arrives in the payload. wmux pairs the two —
+            // "parked on a permission prompt for X" is only resolved by X itself
+            // running — so without this the pane could never unblock on the allow
+            // path. Harmless for the positional PostToolUse form, where the CLI arg
+            // already carries the name and wins.
+            if (!tool)
+                tool = data.tool_name || '';
         }
     }
     catch {
