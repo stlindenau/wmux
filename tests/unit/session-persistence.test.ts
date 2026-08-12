@@ -162,7 +162,7 @@ describe('handleVersionChange (issue #35)', () => {
   // save it stands in for. It used to copy 5 of the 8 fields the auto-save
   // writes, and the missing browserUrl was visible as every workspace's browser
   // reverting to the default page on the first launch of a new version.
-  it('carries browser state, width and pinning into the backup', () => {
+  it('carries browser state, width, pinning and the POSIX cwd into the backup', () => {
     mod.handleVersionChange('1.1.0');
     mod.saveSession({
       version: 1,
@@ -173,6 +173,7 @@ describe('handleVersionChange (issue #35)', () => {
         workspaces: [
           {
             id: 'ws-1', title: 'Docs', pinned: true, shell: 'pwsh.exe', cwd: 'C:\\proj',
+            posixCwd: '/home/u/proj',
             splitTree: { type: 'leaf' },
             browserUrl: 'https://example.com/dashboard',
             browserWidth: 640,
@@ -187,6 +188,9 @@ describe('handleVersionChange (issue #35)', () => {
     expect(ws.browserUrl).toBe('https://example.com/dashboard');
     expect(ws.browserWidth).toBe(640);
     expect(ws.pinned).toBe(true);
+    // Dropping this one would restore the WSL panes of a mixed workspace into
+    // `~` after every update — the very bug posixCwd exists to prevent.
+    expect(ws.posixCwd).toBe('/home/u/proj');
   });
 
   it('normalizes a workspace that never opened a browser', () => {

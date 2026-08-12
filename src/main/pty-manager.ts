@@ -5,6 +5,7 @@ import { execFileSync, spawn } from 'child_process';
 import { v4 as uuidv4 } from 'uuid';
 import { SurfaceId } from '../shared/types';
 import { getPipePath, readPipeToken } from '../shared/instance';
+import { isPosixPath } from '../shared/paths';
 import { PtyLedger } from './pty-ledger';
 
 // ─── Shell resolution ──────────────────────────────────────────────────────
@@ -120,14 +121,6 @@ function getShellType(shell: string): 'powershell' | 'cmd' | 'wsl' | 'unknown' {
   if (lower.includes('cmd')) return 'cmd';
   if (lower.includes('wsl')) return 'wsl';
   return 'unknown';
-}
-
-// A POSIX/WSL path (e.g. /home/user/project restored from session.json — issue
-// #60). Such a path is NOT a valid working dir for a Win32 process and makes
-// pty.spawn fail with error 267 (ERROR_DIRECTORY). Win32 paths are drive-rooted
-// (C:\...) or UNC (\\server\...); a leading forward slash means POSIX.
-function isPosixPath(p: string): boolean {
-  return p.startsWith('/') && !p.startsWith('//');
 }
 
 // The two environment facts resolveShellForCwd depends on, behind an object so
