@@ -121,4 +121,157 @@ describe('wmux bridge transport selection (WSL2 devcontainer path)', () => {
     const echoed = await roundTrip(port, 'ping-npiperelay\n');
     expect(echoed).toContain('ping-npiperelay');
   });
+
+  // Regression: the bridge used to destroy BOTH sides on either 'close', so a
+  // client that wrote a frame and closed immediately — which is exactly what
+  // wmux-hook.js does for every Claude Code hook — had its frame killed inside a
+  // still-draining npiperelay relay (the Duplex's destroy() is child.kill()). The
+  // hook exited 0, the sidebar never updated, and nothing logged an error.
+  //
+  // Measured against a live bridge before the fix, delivery depended purely on how
+  // long the client held the socket open relative to the ~7s pipe round-trip:
+  //     end() after 0ms ✗   2000ms ✗   6000ms ~   9000ms ✓
+  // 0ms is what the hook actually does, hence the bug.
+  it('delivers a frame from a client that closes immediately, even to a slow relay', async () => {
+    // Fake npiperelay that takes its time, standing in for a real one that needs
+    // seconds to attach to the Windows pipe over WSL interop. It records what it
+    // received to a file, so the assertion is "the upstream actually got the
+    // bytes" rather than "a reply came back" — pre-fix the relay is killed before
+    // either could happen.
+    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-slowrelay-'));
+    const fakeBin = path.join(binDir, 'npiperelay.exe');
+    const received = path.join(binDir, 'received.txt');
+    const RELAY_DELAY_MS = 1500;
+    fs.writeFileSync(
+      fakeBin,
+      '#!/usr/bin/env node\n' +
+        "const fs = require('fs');\n" +
+        "let buf = '';\n" +
+        "process.stdin.on('data', (d) => { buf += d; });\n" +
+        // Forward only once stdin has been ENDED and the delay has elapsed. A
+        // bridge that kills us on client close never gets here.
+        "process.stdin.on('end', () => {\n" +
+        `  setTimeout(() => { fs.writeFileSync(${JSON.stringify(received)}, buf); process.stdout.write(buf); }, ${RELAY_DELAY_MS});\n` +
+        '});\n'
+    );
+    fs.chmodSync(fakeBin, 0o755);
+    cleanups.push(() => fs.rmSync(binDir, { recursive: true, force: true }));
+
+    const port = await freePort();
+    const child = await startBridge(port, {
+      ...process.env,
+      WMUX_PIPE: '',
+      WMUX_REMOTE: '',
+      WSL_DISTRO_NAME: 'test-distro',
+      // Comfortably longer than RELAY_DELAY_MS, short enough to keep the suite
+      // quick. Pinned rather than inherited so the test does not depend on the
+      // shipped default.
+      WMUX_BRIDGE_DRAIN_MS: '8000',
+      PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ''}`,
+    } as Record<string, string>);
+    cleanups.push(() => child.kill());
+
+    // The bug trigger: write one frame, then close at once without awaiting a reply.
+    const frame = JSON.stringify({ method: 'hook.event', params: { event: 'Notification' }, id: 1 });
+    await new Promise<void>((resolve, reject) => {
+      const sock = net.connect({ host: '127.0.0.1', port }, () => {
+        sock.write(frame + '\n', () => sock.end());
+      });
+      sock.on('close', () => resolve());
+      sock.on('error', reject);
+    });
+
+    // Poll rather than sleep a fixed span, so a fast machine finishes early and a
+    // slow one still gets its full window.
+    const deadline = Date.now() + RELAY_DELAY_MS + 6000;
+    let got = '';
+    while (Date.now() < deadline) {
+      if (fs.existsSync(received)) {
+        got = fs.readFileSync(received, 'utf-8');
+        if (got.includes('hook.event')) break;
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+
+    expect(got).toContain('hook.event');
+  }, 20000);
+
+  // The other half of the devcontainer latency problem: the bridge used to spawn a
+  // fresh npiperelay.exe per connection, so every hook paid the exec (AV/EDR-scanned
+  // on a corporate host) plus the pipe dial — ~7s measured. The pool spawns relays
+  // ahead of demand so a client gets one already attached.
+  describe('warm relay pool', () => {
+    // Fake npiperelay that records each spawn to a log file, then echoes. Counting
+    // the log is how the test distinguishes "pre-warmed" from "spawned on demand".
+    function makeCountingRelay(): { binDir: string; spawnLog: string } {
+      const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-warm-'));
+      const spawnLog = path.join(binDir, 'spawns.log');
+      fs.writeFileSync(
+        path.join(binDir, 'npiperelay.exe'),
+        '#!/usr/bin/env node\n' +
+          `require('fs').appendFileSync(${JSON.stringify(spawnLog)}, 'x');\n` +
+          'process.stdin.pipe(process.stdout);\n'
+      );
+      fs.chmodSync(path.join(binDir, 'npiperelay.exe'), 0o755);
+      return { binDir, spawnLog };
+    }
+
+    const spawnCount = (logPath: string): number =>
+      (fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf-8').length : 0);
+
+    async function waitFor(fn: () => boolean, timeoutMs = 5000): Promise<void> {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline && !fn()) await new Promise((r) => setTimeout(r, 50));
+    }
+
+    it('spawns relays before any client connects, and refills after one is claimed', async () => {
+      const { binDir, spawnLog } = makeCountingRelay();
+      cleanups.push(() => fs.rmSync(binDir, { recursive: true, force: true }));
+
+      const port = await freePort();
+      const child = await startBridge(port, {
+        ...process.env,
+        WMUX_PIPE: '',
+        WMUX_REMOTE: '',
+        WSL_DISTRO_NAME: 'test-distro',
+        WMUX_BRIDGE_WARM: '2',
+        PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ''}`,
+      } as Record<string, string>);
+      cleanups.push(() => child.kill());
+
+      // Pre-warm happens in the listen callback — no client has connected yet.
+      await waitFor(() => spawnCount(spawnLog) >= 2);
+      expect(spawnCount(spawnLog)).toBe(2);
+
+      // The warm relay must be a working transport, not just a spawned process.
+      expect(await roundTrip(port, 'ping-warm\n')).toContain('ping-warm');
+
+      // Claiming one triggers a replacement, so the next client is served warm too.
+      await waitFor(() => spawnCount(spawnLog) >= 3);
+      expect(spawnCount(spawnLog)).toBe(3);
+    }, 20000);
+
+    it('spawns nothing ahead of time when WMUX_BRIDGE_WARM=0', async () => {
+      const { binDir, spawnLog } = makeCountingRelay();
+      cleanups.push(() => fs.rmSync(binDir, { recursive: true, force: true }));
+
+      const port = await freePort();
+      const child = await startBridge(port, {
+        ...process.env,
+        WMUX_PIPE: '',
+        WMUX_REMOTE: '',
+        WSL_DISTRO_NAME: 'test-distro',
+        WMUX_BRIDGE_WARM: '0',
+        PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ''}`,
+      } as Record<string, string>);
+      cleanups.push(() => child.kill());
+
+      await new Promise((r) => setTimeout(r, 500));
+      expect(spawnCount(spawnLog)).toBe(0);
+
+      // Opting out restores spawn-per-connection, which must still work.
+      expect(await roundTrip(port, 'ping-cold\n')).toContain('ping-cold');
+      expect(spawnCount(spawnLog)).toBe(1);
+    }, 20000);
+  });
 });

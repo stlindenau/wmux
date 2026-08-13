@@ -25,6 +25,34 @@ const PIPE_PATH = process.env.WMUX_PIPE || '\\\\.\\pipe\\wmux';
 const DEFAULT_BRIDGE_PORT = 9787;
 let remoteTarget: { host: string; port: number } | null = null;
 
+// How long `wmux bridge` lets a relay keep draining after its client socket has
+// closed, before forcing teardown. Must exceed the pipe round-trip, or the frame
+// a write-then-close client just sent is discarded mid-flight. Measured worst
+// case inside a devcontainer on a corporate-managed Windows host is ~7s (a fresh
+// npiperelay.exe is spawned per connection over WSL interop, and AV/EDR scans it
+// on every exec), so the default leaves generous headroom. The relay normally
+// exits on its own well before this — the timer is only the backstop.
+const BRIDGE_DRAIN_GRACE_MS =
+  parseInt(process.env.WMUX_BRIDGE_DRAIN_MS || '', 10) || 15000;
+
+// Ceiling for a single V2 request/response. The old hardcoded 5s sat BELOW the
+// ~7s round-trip above, so requests from a devcontainer timed out, tore the
+// socket down, and lost the write — reporting `Error: timeout` for a call that
+// would have succeeded.
+const RPC_TIMEOUT_MS =
+  parseInt(process.env.WMUX_RPC_TIMEOUT_MS || '', 10) || 30000;
+
+// How many npiperelay relays `wmux bridge` keeps spawned and attached to the pipe
+// ahead of demand (see the pool in cmdBridge). 0 disables pre-warming and restores
+// spawn-per-connection. Only ever used on the npiperelay path — the Unix-socket and
+// native-pipe transports connect instantly and have nothing to pre-warm.
+const BRIDGE_WARM_RELAYS = (() => {
+  const raw = process.env.WMUX_BRIDGE_WARM?.trim();
+  if (!raw) return 2;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 0 ? n : 2;
+})();
+
 function parseRemoteTarget(spec: string): { host: string; port: number } {
   const idx = spec.lastIndexOf(':');
   if (idx === -1) return { host: spec, port: DEFAULT_BRIDGE_PORT };
@@ -73,6 +101,15 @@ function connectTransport(onConnect: () => void): net.Socket | Duplex {
   return net.connect({ path: PIPE_PATH }, onConnect);
 }
 
+// Mirrors the selection order above: true when connectTransport() will take the
+// npiperelay branch. That is the only transport whose setup costs anything worth
+// pre-warming — a Unix socket or a native named pipe connects in microseconds.
+function usesNpiperelay(): boolean {
+  return !remoteTarget
+    && !PIPE_PATH.startsWith('/')
+    && Boolean(process.env.WSL_DISTRO_NAME || process.env.WSLENV);
+}
+
 // Search common installation locations for npiperelay.exe.
 function findNpiperelay(): string | null {
   const candidates = [
@@ -105,6 +142,9 @@ function connectViaNpiperelay(pipePath: string, onConnect: () => void): Duplex {
       child.stdin.write(chunk, enc, cb);
     },
     final(cb) { child.stdin?.end(); cb(); },
+    // Kills the relay, discarding anything still buffered in its stdin. Callers
+    // must only reach here on error or after the stream has drained — see the
+    // teardown in cmdBridge.
     destroy(err, cb) { child.kill(); cb(err); },
     allowHalfOpen: true,
   });
@@ -114,7 +154,15 @@ function connectViaNpiperelay(pipePath: string, onConnect: () => void): Duplex {
   child.on('exit', (code: number | null) => {
     if (code !== 0 && code !== null) duplex.destroy(new Error(`npiperelay exited with code ${code}`));
   });
-  // Connection is ready as soon as the process starts
+  // "Ready" here means the relay process exists — NOT that it has attached to the
+  // named pipe, which over WSL interop can take seconds longer. onConnect must
+  // still fire now regardless: callers write their request from inside it, and the
+  // Duplex buffers those bytes until the pipe is live. (Deferring it until the
+  // first byte comes back would deadlock — nothing would ever be written.)
+  //
+  // The cost is that a caller's timeout starts before the pipe is up, so it has to
+  // cover the attach latency too. That is what RPC_TIMEOUT_MS is sized for; the
+  // old 5s sat below it and turned a slow attach into a lost write.
   process.nextTick(onConnect);
   return duplex;
 }
@@ -145,7 +193,7 @@ function sendV1(command: string): Promise<string> {
       client.write(line + '\n');
     });
     let data = '';
-    const timer = setTimeout(() => { client.end(); resolve(data.trim()); }, 5000);
+    const timer = setTimeout(() => { client.end(); resolve(data.trim()); }, RPC_TIMEOUT_MS);
     const finish = () => { clearTimeout(timer); resolve(data.trim()); };
     client.on('data', (chunk) => {
       data += chunk.toString();
@@ -174,7 +222,7 @@ function sendV2(method: string, params: Record<string, any> = {}): Promise<any> 
       client.write(request + '\n');
     });
     let data = '';
-    const timer = setTimeout(() => { client.end(); reject(new Error('timeout')); }, 5000);
+    const timer = setTimeout(() => { client.end(); reject(new Error(`timeout after ${RPC_TIMEOUT_MS}ms`)); }, RPC_TIMEOUT_MS);
     client.on('data', (chunk) => {
       data += chunk.toString();
       if (data.includes('\n')) {
@@ -424,24 +472,140 @@ async function cmdBridge(args: string[]): Promise<void> {
     console.warn('WARNING: binding beyond localhost exposes the wmux pipe to the network.');
     console.warn(`Prefer the default 127.0.0.1 + an SSH tunnel: ssh -L ${port}:127.0.0.1:${port} user@host`);
   }
+  // ── Warm relay pool ─────────────────────────────────────────────────────────
+  // Spawn-per-connection made every request pay the relay's whole startup: a fresh
+  // npiperelay.exe launched over WSL interop (AV/EDR scans the binary on each exec
+  // on a corporate-managed host) and then the pipe dial. Measured worst case from a
+  // devcontainer is ~7s — on every hook, and it is what turned the teardown bug
+  // below from a race into a certainty. Keeping relays open ahead of demand moves
+  // that cost off the request path: a warm relay has already spawned AND attached
+  // by the time a client arrives, so hand-off is just pipe().
+  //
+  // Deliberately a POOL of exclusive relays, not one shared relay multiplexed
+  // across clients. Multiplexing would force the bridge to parse frames and rewrite
+  // JSON-RPC ids to route replies back to the right socket, which:
+  //   * breaks V1 entirely — `pong` / `ok` / `unauthorized` carry no id to route on;
+  //   * makes every client a casualty when the single relay dies;
+  //   * costs the bridge its one real virtue, being a transparent byte pipe (any
+  //     future streaming or server-pushed method would have to be taught to it).
+  // Pooling buys the same latency win and the bridge stays dumb.
+  //
+  // Only on the npiperelay path — elsewhere this would hold idle sockets open to buy
+  // nothing.
+  const warmSize = usesNpiperelay() ? BRIDGE_WARM_RELAYS : 0;
+  const warm: Array<{ stream: net.Socket | Duplex; claim: () => void }> = [];
+  let warmFailures = 0;
+  let refillTimer: NodeJS.Timeout | null = null;
+
+  const scheduleRefill = (delayMs: number): void => {
+    if (refillTimer || warm.length >= warmSize) return;
+    refillTimer = setTimeout(() => { refillTimer = null; fillWarm(); }, delayMs);
+    refillTimer.unref();
+  };
+
+  function fillWarm(): void {
+    while (warm.length < warmSize) {
+      const stream = connectTransport(() => {});
+      const entry = { stream, claim: () => {} };
+      // Dying before being claimed means the upstream isn't there — wmux not
+      // running, or the pipe gone. npiperelay exits immediately in that case, so
+      // without a backoff the bridge would respawn a Windows process in a tight
+      // loop for as long as wmux stays down.
+      const onDead = (): void => {
+        const i = warm.indexOf(entry);
+        if (i === -1) return; // already claimed — the client's teardown owns it now
+        warm.splice(i, 1);
+        warmFailures = Math.min(warmFailures + 1, 6);
+        scheduleRefill(Math.min(30000, 500 * 2 ** warmFailures));
+      };
+      entry.claim = () => { stream.off('error', onDead); stream.off('close', onDead); };
+      stream.on('error', onDead);
+      stream.on('close', onDead);
+      warm.push(entry);
+    }
+  }
+
+  // An idle relay reads nothing, so anything the upstream sent while it waited stays
+  // buffered in the stream and is delivered the moment the client pipes it — no need
+  // to drain before hand-off.
+  const takeWarm = (): net.Socket | Duplex | null => {
+    while (warm.length) {
+      const entry = warm.pop()!;
+      entry.claim();
+      // wmux may have restarted since this relay attached.
+      if (!entry.stream.destroyed && entry.stream.writable) {
+        warmFailures = 0;
+        return entry.stream;
+      }
+      entry.stream.destroy();
+    }
+    return null;
+  };
+
   const server = net.createServer((sock) => {
     // Connect to the local wmux via the same transport selector the CLI uses.
     // In the bridge process remoteTarget is always null, so this resolves to:
     // Unix socket (WMUX_PIPE=/path) → npiperelay.exe (inside WSL2) → the named
     // pipe directly (native Windows). This is what lets `wmux bridge` run from
     // inside WSL2 and still reach the Windows-host pipe over interop.
-    const pipe = connectTransport(() => {});
+    // A warm relay is the same thing, already connected.
+    const pipe = takeWarm() ?? connectTransport(() => {});
+    // Replace what we just consumed so the next client is served warm too. Deferred
+    // by a tick rather than spawned inline, to keep the accept path cheap.
+    scheduleRefill(0);
     sock.pipe(pipe);
     pipe.pipe(sock);
-    const drop = () => { sock.destroy(); pipe.destroy(); };
-    sock.on('error', drop);
-    pipe.on('error', drop);
-    sock.on('close', drop);
-    pipe.on('close', drop);
+
+    // Teardown is half-close-aware on purpose. The old code destroyed BOTH sides
+    // on either 'close', which silently ate hook events: wmux-hook.js writes its
+    // frame and end()s immediately, and over npiperelay the Duplex's destroy() is
+    // child.kill() — so the relay died with the frame still buffered in its stdin
+    // and never forwarded it. Clients that write-then-close are the normal case
+    // here (every Claude Code hook is one), not an abort.
+    //
+    // 'end' (peer finished sending) must therefore FLUSH, not destroy: end() the
+    // other side so its buffered bytes drain and the pipe sees a clean EOF.
+    // destroy() is reserved for 'error', where there is nothing left to save.
+    let done = false;
+    const destroyBoth = () => {
+      if (done) return;
+      done = true;
+      sock.destroy();
+      pipe.destroy();
+    };
+    // A closed socket can no longer drain anything, so 'close' still tears down —
+    // but only after a grace period, giving an in-flight relay time to finish
+    // forwarding what it already holds.
+    const closeAfterDrain = () => {
+      if (done) return;
+      setTimeout(destroyBoth, BRIDGE_DRAIN_GRACE_MS).unref();
+    };
+
+    sock.on('error', destroyBoth);
+    pipe.on('error', destroyBoth);
+    sock.on('end', () => { pipe.end(); });
+    pipe.on('end', () => { sock.end(); });
+    sock.on('close', closeAfterDrain);
+    pipe.on('close', closeAfterDrain);
   });
   server.on('error', (err) => { console.error(`bridge error: ${err.message}`); process.exit(1); });
+
+  // Warm relays hold a live pipe connection (and an npiperelay.exe) for as long as
+  // the bridge runs, so retire them on the way out rather than orphaning them.
+  const shutdown = (): void => {
+    if (refillTimer) clearTimeout(refillTimer);
+    warm.splice(0).forEach((e) => { e.claim(); e.stream.destroy(); });
+    process.exit(0);
+  };
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
+
   server.listen(port, host, () => {
     console.log(`wmux bridge listening on ${host}:${port} ↔ ${PIPE_PATH}`);
+    if (warmSize > 0) {
+      fillWarm();
+      console.log(`Keeping ${warmSize} npiperelay relay(s) warm (WMUX_BRIDGE_WARM=0 to disable).`);
+    }
     if (wslMode) {
       console.log('WSL2 mode: from WSL2 terminal run:');
       console.log(`  WMUX_WSL_GATEWAY=$(ip route show default | awk '/default/{print $3}')`);
