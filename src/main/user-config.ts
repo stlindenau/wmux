@@ -35,6 +35,10 @@
  *   "ctrl+k"     = "<C-k><Delete>"
  *   "ctrl+alt+r" = "clear<CR>"
  *
+ *   [wsl]
+ *   enforce-cwd = true         # type an explicit `cd` in WSL panes, because a
+ *                              # distro login rc can discard `wsl.exe --cd`
+ *
  * File-wins-at-startup, app-wins-at-runtime: this data seeds the store
  * on boot; users can still tweak via the Settings UI afterwards.
  * A `wmux reload-config` command re-applies the file over runtime state.
@@ -84,6 +88,18 @@ export interface UserConfig {
    * the rest of the config's errors, rather than failing silently per keypress.
    */
   keys?: KeyRemap[];
+  /** WSL pane behavior. */
+  wsl?: {
+    /**
+     * Type an explicit `cd` into a WSL pane once its shell is up, instead of
+     * trusting `wsl.exe --cd` alone (default true). WSL applies `--cd` before
+     * the interactive login shell reads its rc, so a distro whose
+     * /etc/profile or ~/.profile cds to $HOME silently discards it and every
+     * pane opens in the home directory. Set false on a distro where `--cd`
+     * holds, to avoid the echoed `cd` line above the first prompt.
+     */
+    enforceCwd?: boolean;
+  };
   /** Absolute path the config was read from (for diagnostics). */
   path?: string;
   /** Any parse or mapping errors — non-fatal, surfaced to the renderer. */
@@ -277,6 +293,15 @@ function mapBrowserSection(root: TomlTable, errors: string[]): NonNullable<UserC
   return Object.keys(out).length ? out : undefined;
 }
 
+// WSL pane behavior: `[wsl] enforce-cwd = bool`.
+function mapWslSection(root: TomlTable): NonNullable<UserConfig['wsl']> | undefined {
+  const wsl = asTable(root.wsl);
+  if (!wsl) return undefined;
+
+  const enforceCwd = asBool(wsl['enforce-cwd'] ?? wsl.enforceCwd);
+  return enforceCwd === undefined ? undefined : { enforceCwd };
+}
+
 /**
  * Key remaps: `[keys] "ctrl+k" = "<C-k><Delete>"` (issue #146).
  *
@@ -306,6 +331,9 @@ function mapToConfig(root: TomlTable, errors: string[]): UserConfig {
 
   const keys = mapKeysSection(root, errors);
   if (keys) out.keys = keys;
+
+  const wsl = mapWslSection(root);
+  if (wsl) out.wsl = wsl;
 
   return out;
 }

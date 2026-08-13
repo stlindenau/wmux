@@ -6,6 +6,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { SurfaceId } from '../shared/types';
 import { getPipePath, readPipeToken } from '../shared/instance';
 import { isPosixPath } from '../shared/paths';
+import { loadUserConfig, UserConfig } from './user-config';
 import { PtyLedger } from './pty-ledger';
 
 // ─── Shell resolution ──────────────────────────────────────────────────────
@@ -180,6 +181,57 @@ export function resolveSpawnCwd(cwd: string | undefined): string | undefined {
   return fallback;
 }
 
+// Single-quote a path for POSIX sh: everything between the quotes is literal,
+// and an embedded quote is closed / backslash-escaped / reopened. Keeps a
+// directory containing spaces, $, backticks or quotes intact when the path is
+// typed at the pane's prompt rather than passed as an argv entry.
+function quotePosix(p: string): string {
+  return `'${p.split("'").join("'\\''")}'`;
+}
+
+// The `[wsl] enforce-cwd` lookup behind an object so a test can substitute the
+// config without writing to the real ~/.wmux/config.toml. Read per pane create
+// rather than cached: the file is small, create() is a user-driven action, and
+// a pane spawned after an edit then picks the new value up on its own, with no
+// `wmux reload-config` in between.
+//
+// Defaults to enforcing. On a distro where --cd already holds, the cost is one
+// echoed `cd` line above the first prompt; where it doesn't, the cost of the
+// other default is every pane opening in the wrong directory.
+interface WslCwdPolicy {
+  load: () => UserConfig;
+  enforce: () => boolean;
+}
+export const wslCwdPolicy: WslCwdPolicy = {
+  load: () => loadUserConfig(),
+  enforce: () => wslCwdPolicy.load().wsl?.enforceCwd ?? true,
+};
+
+/**
+ * The `cd` a freshly spawned WSL pane has to be told explicitly, or null when
+ * none is needed.
+ *
+ * `wsl.exe --cd` (see buildShellArgs) is applied BEFORE the interactive login
+ * shell reads its rc, so on a distro whose /etc/profile or ~/.profile cds to
+ * $HOME — a common corporate setup — it is silently overwritten and every
+ * pane, fresh or restored, opens in the home directory instead of the project.
+ * A command typed after the shell is up is the one channel the rc cannot
+ * override, so synthesize one and let the caller send it.
+ *
+ * WSL only: pwsh/cmd get a real Win32 working directory from resolveSpawnCwd,
+ * and an 'unknown' spec may be a remote command line (`ssh user@host`) where a
+ * local path means nothing.
+ */
+export function wslCdCommand(
+  shellType: ReturnType<typeof getShellType>,
+  cwd: string | undefined,
+): string | null {
+  if (shellType !== 'wsl') return null;
+  if (!cwd || !isPosixPath(cwd)) return null;
+  if (!wslCwdPolicy.enforce()) return null;
+  return `cd ${quotePosix(cwd)}`;
+}
+
 // Build the launch args for a shell and mutate `env` with shell-specific vars.
 // Kept out of create() so that hot path stays under the cognitive-complexity
 // budget. `env` is mutated in place (integration script paths, WSLENV, etc.).
@@ -218,6 +270,12 @@ function buildShellArgs(
     // A restored WSL/POSIX cwd (issue #60) can't be a Win32 process cwd (error
     // 267). Open it INSIDE the distro via --cd instead; the Win32-side cwd is
     // sanitized to a valid Windows dir by the caller.
+    //
+    // --cd is BEST-EFFORT: WSL applies it before the interactive login shell
+    // reads its rc, so a distro whose /etc/profile or ~/.profile cds to $HOME
+    // discards it and the pane opens at home. It still gets the FIRST prompt
+    // right wherever the rc leaves it alone, so keep passing it; wslCdCommand()
+    // below covers the distros where it doesn't survive.
     const posixCwd = cwd && isPosixPath(cwd) ? cwd : null;
     return ['--cd', posixCwd ?? '~'];
   }
@@ -257,6 +315,22 @@ export interface CreateOptions {
    *  they are baked into the shell's own startup (see `startupCommandsConsumed`
    *  in the return value) rather than injected later as keystrokes. */
   startupCommands?: string[];
+}
+
+export interface CreateResult {
+  id: SurfaceId;
+  shell: string;
+  /** Startup commands were baked into the shell's own init, not left to type. */
+  startupCommandsConsumed: boolean;
+  /** A live PTY for this surfaceId already existed and was handed back as-is. */
+  reused: boolean;
+  /**
+   * A `cd` the caller must send once the shell has a prompt, because this WSL
+   * pane's login rc would otherwise discard `wsl.exe --cd` (see wslCdCommand).
+   * Absent for every other shell type, and for a reused PTY — that one is
+   * already sitting where it was put.
+   */
+  cwdCommand?: string;
 }
 
 // Primary Device Attributes (DA1). oh-my-posh / PSReadLine probe the terminal
@@ -300,7 +374,7 @@ export class PtyManager {
   private static readonly CHUNK_THRESHOLD = 1024;
   private static readonly CHUNK_SIZE = 1024;
 
-  create(options: CreateOptions): { id: SurfaceId; shell: string; startupCommandsConsumed: boolean; reused: boolean } {
+  create(options: CreateOptions): CreateResult {
     const id: SurfaceId = options.surfaceId ?? `surf-${uuidv4()}` as SurfaceId;
 
     // Idempotent per surfaceId. React StrictMode (dev) double-mounts the terminal
@@ -383,6 +457,12 @@ export class PtyManager {
       startupCommandsConsumed = true;
     }
 
+    // The WSL counterpart: there is no profile to bake anything into, and the
+    // distro's login rc may have cd'd away from --cd's directory, so the pane
+    // has to be told where it is. Sent by the caller, ahead of any startup
+    // command, once the shell is up — see wslCdCommand.
+    const cwdCommand = wslCdCommand(shellType, options.cwd) ?? undefined;
+
     // CreateProcess fails with error 267 (ERROR_DIRECTORY) when the working dir
     // isn't a real directory, and node-pty surfaces that as an opaque "Cannot
     // create process, error code: 267" — the pane just dies. Two ways to get
@@ -458,7 +538,7 @@ export class PtyManager {
     }
 
     this.ptys.set(id, entry);
-    return { id, shell, startupCommandsConsumed, reused: false };
+    return { id, shell, startupCommandsConsumed, reused: false, cwdCommand };
   }
 
   write(id: SurfaceId, data: string): void {

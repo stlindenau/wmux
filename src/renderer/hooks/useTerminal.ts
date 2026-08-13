@@ -781,10 +781,18 @@ export function useTerminal({ surfaceId, shell, cwd, visible = true, focused = t
     // leaking onto the prompt as `\x1b[?62;4;9;22c` and merging with an injected
     // `<cmd>\r` into a bogus line like `62;4;9;22ccls`). When `consumed` is true
     // we MUST NOT also inject, or the commands would run twice.
-    const runStartupCommands = (id: string, consumed: boolean) => {
-      if (consumed) return;
-      const cmds = startupCommandsRef.current;
-      if (!cmds || cmds.length === 0) return;
+    //
+    // `cwdCommand` rides the same delay: it is the `cd` main synthesized for a
+    // WSL pane whose login rc discards `wsl.exe --cd`. It is never baked into a
+    // profile (that path is PowerShell-only), so it runs regardless of
+    // `consumed`, and it goes FIRST — a restore command must find itself in the
+    // pane's directory, not in $HOME.
+    const runStartupCommands = (id: string, consumed: boolean, cwdCommand?: string) => {
+      const cmds = [
+        ...(cwdCommand ? [cwdCommand] : []),
+        ...(consumed ? [] : startupCommandsRef.current ?? []),
+      ];
+      if (cmds.length === 0) return;
       setTimeout(() => {
         for (const cmd of cmds) {
           if (typeof cmd === 'string' && cmd.length > 0) {
@@ -823,12 +831,12 @@ export function useTerminal({ surfaceId, shell, cwd, visible = true, focused = t
         } else {
           // No existing PTY — create a new one, passing surfaceId so PTY ID = Surface ID
           window.wmux.pty.create({ shell: effectiveShell, cwd: cwd ?? '', env: {}, surfaceId, startupCommands: startupCommandsRef.current, cols: initialCols, rows: initialRows })
-            .then((created: { id: string; shell: string; startupCommandsConsumed?: boolean }) => {
+            .then((created: { id: string; shell: string; startupCommandsConsumed?: boolean; cwdCommand?: string }) => {
               // PTY persists (keep-alive); a remount re-attaches via pty.has.
               if (disposed) return;
               setResolvedShellForSurface(surfaceId, created.shell);
               attachToPty(created.id);
-              runStartupCommands(created.id, !!created.startupCommandsConsumed);
+              runStartupCommands(created.id, !!created.startupCommandsConsumed, created.cwdCommand);
             })
             .catch((err: unknown) => terminal.writeln(`\r\n\x1b[31m[failed to create PTY: ${err}]\x1b[0m`));
         }
@@ -836,11 +844,11 @@ export function useTerminal({ surfaceId, shell, cwd, visible = true, focused = t
     } else {
       // No surfaceId hint — always create new PTY
       window.wmux.pty.create({ shell: effectiveShell, cwd: cwd ?? '', env: {}, startupCommands: startupCommandsRef.current, cols: initialCols, rows: initialRows })
-        .then((created: { id: string; shell: string; startupCommandsConsumed?: boolean }) => {
+        .then((created: { id: string; shell: string; startupCommandsConsumed?: boolean; cwdCommand?: string }) => {
           if (disposed) return;
           setResolvedShellForSurface(surfaceId, created.shell);
           attachToPty(created.id);
-          runStartupCommands(created.id, !!created.startupCommandsConsumed);
+          runStartupCommands(created.id, !!created.startupCommandsConsumed, created.cwdCommand);
         })
         .catch((err: unknown) => terminal.writeln(`\r\n\x1b[31m[failed to create PTY: ${err}]\x1b[0m`));
     }

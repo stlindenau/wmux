@@ -8,6 +8,8 @@ import {
   resolveSpawnCwd,
   resolveShellForCwd,
   shellEnv,
+  wslCdCommand,
+  wslCwdPolicy,
 } from '../../src/main/pty-manager';
 import type { SurfaceId } from '../../src/shared/types';
 
@@ -322,5 +324,65 @@ describe('resolveShellForCwd (POSIX cwd → WSL shell)', () => {
   it('is a no-op off Windows', () => {
     vi.spyOn(shellEnv, 'isWindows').mockReturnValue(false);
     expect(resolveShellForCwd('/bin/bash', POSIX)).toBe('/bin/bash');
+  });
+});
+
+/**
+ * `wsl.exe --cd` is applied before the interactive login shell reads its rc, so
+ * a distro whose /etc/profile or ~/.profile cds to $HOME discards it and every
+ * pane opens in the home directory. Reproduced by hand:
+ *
+ *   > wsl --cd /tmp -- pwd     ->  /tmp        (non-interactive: --cd holds)
+ *   > wsl --cd /tmp            ->  ~           (interactive login: rc wins)
+ *
+ * So the pane has to be told where it is, once its shell is up.
+ */
+describe('wslCdCommand (typed cd for WSL panes)', () => {
+  const POSIX = '/home/user/agent/project';
+
+  // An empty config — i.e. the default, with no ~/.wmux/config.toml at all.
+  beforeEach(() => {
+    vi.spyOn(wslCwdPolicy, 'load').mockReturnValue({});
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it('synthesizes a quoted cd for a WSL pane with a POSIX cwd, by default', () => {
+    // A pane in the wrong directory is worse than an echoed `cd` line, so this
+    // is on unless the user opts out.
+    expect(wslCdCommand('wsl', POSIX)).toBe(`cd '${POSIX}'`);
+  });
+
+  it('quotes a path containing spaces', () => {
+    expect(wslCdCommand('wsl', '/home/user/my projects/app')).toBe("cd '/home/user/my projects/app'");
+  });
+
+  it("escapes an embedded single quote as '\\''", () => {
+    // A literal quote would otherwise close the string and turn the rest of the
+    // path into shell syntax.
+    expect(wslCdCommand('wsl', "/home/user/o'brien")).toBe("cd '/home/user/o'\\''brien'");
+  });
+
+  it('stays out of the way when there is no POSIX directory to go to', () => {
+    expect(wslCdCommand('wsl', undefined)).toBeNull();
+    expect(wslCdCommand('wsl', '')).toBeNull();
+    expect(wslCdCommand('wsl', 'C:\\work\\project')).toBeNull();
+  });
+
+  it('is WSL-only — other shells already get a working cwd', () => {
+    // pwsh/cmd receive a real Win32 working dir from resolveSpawnCwd, and an
+    // 'unknown' spec may be `ssh user@host`, where a local path means nothing.
+    expect(wslCdCommand('powershell', POSIX)).toBeNull();
+    expect(wslCdCommand('cmd', POSIX)).toBeNull();
+    expect(wslCdCommand('unknown', POSIX)).toBeNull();
+  });
+
+  it('types nothing when [wsl] enforce-cwd = false', () => {
+    vi.spyOn(wslCwdPolicy, 'load').mockReturnValue({ wsl: { enforceCwd: false } });
+    expect(wslCdCommand('wsl', POSIX)).toBeNull();
+  });
+
+  it('honours an explicit enforce-cwd = true', () => {
+    vi.spyOn(wslCwdPolicy, 'load').mockReturnValue({ wsl: { enforceCwd: true } });
+    expect(wslCdCommand('wsl', POSIX)).toBe(`cd '${POSIX}'`);
   });
 });

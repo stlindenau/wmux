@@ -61,6 +61,10 @@ export class AgentManager {
       // Brief pause after prompt detection to let the shell fully settle
       setTimeout(() => {
         if (this.ptyManager.has(surfaceId)) {
+          // A WSL pane may have been dropped in $HOME by its login rc despite
+          // --cd (see PtyManager.create); put it in the agent's cwd first, or
+          // the agent runs against the wrong tree.
+          if (created.cwdCommand) this.ptyManager.write(surfaceId, created.cwdCommand + '\r');
           this.ptyManager.write(surfaceId, params.cmd + '\r');
         }
       }, 150);

@@ -133,6 +133,37 @@ describe('loadUserConfig', () => {
     expect(out.browser).toBeUndefined();
   });
 
+  it('maps the [wsl] section: enforce-cwd', () => {
+    tmpPath = writeTmp(`
+      [wsl]
+      enforce-cwd = false
+    `);
+    const out = loadUserConfig(tmpPath);
+    expect(out.errors).toEqual([]);
+    expect(out.wsl?.enforceCwd).toBe(false);
+  });
+
+  it('accepts the camelCase wsl key', () => {
+    tmpPath = writeTmp(`
+      [wsl]
+      enforceCwd = true
+    `);
+    expect(loadUserConfig(tmpPath).wsl?.enforceCwd).toBe(true);
+  });
+
+  // Absent section and a non-boolean value both leave the key undefined, so the
+  // caller's own default (enforce) applies — a typo must not silently opt out.
+  it('leaves wsl undefined when the section is absent or the value is not a bool', () => {
+    tmpPath = writeTmp(`
+      [terminal]
+      font-size = 13
+    `);
+    expect(loadUserConfig(tmpPath).wsl).toBeUndefined();
+
+    fs.writeFileSync(tmpPath, '[wsl]\nenforce-cwd = "yes"\n', 'utf-8');
+    expect(loadUserConfig(tmpPath).wsl).toBeUndefined();
+  });
+
   // Issue #146 — `[keys]` remaps: the config file is the plugin-shaped ask,
   // answered without a plugin runtime.
   it('parses the [keys] section into validated remaps', () => {
