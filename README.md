@@ -350,6 +350,12 @@ notify <surface_id> <text>
 ping
 ```
 
+`report_startup_command` is replayed as keystrokes into a freshly spawned shell,
+whose working directory is not guaranteed (a WSL distro's login rc can discard
+`wsl.exe --cd` — see `[wsl] enforce-cwd` in [docs/config.md](docs/config.md)).
+Send a cwd-independent command: an absolute path, or one that opens with its own
+`cd`.
+
 **V2** (JSON-RPC, used by CLI and automation):
 ```json
 {"method": "workspace.create", "params": {"title": "Agent 1"}}

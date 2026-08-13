@@ -95,9 +95,49 @@ through this transport once configured:
 - `wmux-hook.js` (Claude Code PostToolUse/Notification/Stop/SubagentStop
   hooks) — connects over TCP directly when `WMUX_REMOTE` is set, mirroring
   `connectTransport()` in `wmux.ts`.
-- `wmux-bash-integration.sh` (git branch/dirty/cwd/shell-state reporting) —
-  calls `wmux raw-v1 <line>` when `WMUX_REMOTE` is set, instead of writing to
-  the native WSL temp-file path.
+- `wmux-bash-integration.sh` (git branch/dirty/cwd/shell-state reporting, and
+  `report_startup_command` for session restore) — calls `wmux raw-v1 <line>`
+  when `WMUX_REMOTE` is set, instead of writing to the native WSL temp-file
+  path.
+
+## Working directory: a restored pane may start in `$HOME`
+
+A devcontainer pane is a WSL pane from wmux's point of view, and WSL panes do
+not reliably start where wmux puts them. `wsl.exe --cd <dir>` is applied
+**before** the interactive login shell reads its rc, so a distro whose
+`/etc/profile` or `~/.profile` ends up in `$HOME` — common on managed images —
+discards it:
+
+```
+> wsl --cd /tmp -- pwd     # non-interactive: /tmp        — --cd holds
+> wsl --cd /tmp            # interactive login: ~         — the rc wins
+```
+
+wmux compensates by typing an explicit `cd` into the pane once its shell is up
+(`[wsl] enforce-cwd`, on by default — see `docs/config.md`). But that only
+covers directories wmux knows about, and a user can switch it off, so:
+
+> **A command sent via `report_startup_command` must be cwd-independent.**
+
+wmux replays it as keystrokes into a freshly spawned shell. A relative
+`./relaunch-my-container.sh` dies with "No such file or directory" the moment
+the pane comes up in the home directory, and the container is never re-entered.
+Report an absolute path, or open the command with its own `cd`:
+
+```bash
+_wmux_report "report_startup_command ${WMUX_SURFACE_ID} cd '/home/me/project' && ./relaunch.sh"
+```
+
+Expand the path where you *send* the report — inside the container, from
+whatever variable the launcher forwarded — so the stored command holds a
+literal host-side path and does not depend on the restored shell's environment.
+Single-quote it: it is typed at a prompt, so a space would split it and a `$`
+would expand. A redundant `cd` (wmux typed one, the command starts with
+another) is a harmless no-op; the two do not need to coordinate.
+
+Reporting the pane's cwd has the same requirement in reverse: `$(pwd)` inside a
+container is a container path that means nothing on the Windows/WSL side, so
+report the host-side workspace path instead.
 
 ## Without the remote transport
 

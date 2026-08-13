@@ -53,6 +53,10 @@ palette = [
 "ctrl+k"       = "<C-k><Delete>"   # kill to end of line, then pull the next line up
 "ctrl+alt+r"   = "clear<CR>"
 "ctrl+shift+q" = ""                # empty value = swallow the key
+
+[wsl]
+# Type an explicit `cd` in WSL panes (see "WSL working directory" below).
+enforce-cwd = true
 ```
 
 ## Key remaps
@@ -92,6 +96,46 @@ Notes:
 - A binding that doesn't parse is reported by `wmux config show` and skipped;
   the rest of your bindings still apply.
 - `wmux reload-config` applies edits live, including removing bindings.
+
+## WSL working directory
+
+```toml
+[wsl]
+enforce-cwd = true   # default
+```
+
+When wmux opens a WSL pane in a directory — a new tab, a split, or a pane
+restored from the last session — it passes that directory to `wsl.exe --cd`.
+WSL applies `--cd` **before** the interactive login shell reads its rc, so a
+distro whose `/etc/profile` or `~/.profile` ends up in `$HOME` (common on
+managed/corporate images) silently discards it:
+
+```
+> wsl --cd /tmp -- pwd     # non-interactive: /tmp        — --cd holds
+> wsl --cd /tmp            # interactive login: ~         — the rc wins
+```
+
+The pane then opens in the home directory instead of the project, and anything
+replayed into it — a quick-launch startup command, a restored session's command
+— runs in the wrong place.
+
+With `enforce-cwd` on (the default), wmux additionally types a `cd '<dir>'` into
+the pane once its shell is up, which is the one channel the rc cannot override.
+`--cd` is still passed, so on a distro that honours it the first prompt is
+already correct and the `cd` is a no-op.
+
+Set `enforce-cwd = false` if your distro honours `--cd` and you would rather not
+see the extra `cd` line above the first prompt.
+
+Notes:
+
+- WSL panes only. PowerShell and cmd panes get a real Win32 working directory,
+  which Windows does not let an rc file take away.
+- The value is read when a pane is created, so a new pane picks up an edit
+  without `wmux reload-config`. Panes that are already open keep their
+  directory either way.
+- The real fix, where you control the image, is to stop the login rc from
+  changing directory — then `--cd` works on its own and this flag is moot.
 
 ## Precedence
 
