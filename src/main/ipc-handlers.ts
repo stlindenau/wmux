@@ -14,7 +14,7 @@ import { listSystemFonts } from './font-detector';
 import { isContextMenuInstalled, installContextMenu, uninstallContextMenu } from './shell-context-menu';
 import { getDefaultTheme, getThemeByName, loadBundledThemes } from './theme-loader';
 import { parseWindowsTerminalConfig, parseGhosttyConfig, loadProjectProfiles, importWindowsTerminalProfiles } from './config-loader';
-import { loadUserConfig, getConfigPath } from './user-config';
+import { loadUserConfig, getConfigPath, resetConfigWarnings } from './user-config';
 import { WindowManager } from './window-manager';
 import { CDPBridge } from './cdp-bridge';
 import { CDPProxy } from './cdp-proxy';
@@ -191,6 +191,9 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
   });
 
   ipcMain.handle(IPC_CHANNELS.CONFIG_RELOAD_USER_CONFIG, async () => {
+    // See the config.reload pipe handler in index.ts: a reload re-reports the
+    // file's remaining problems instead of staying quiet about pre-edit ones.
+    resetConfigWarnings();
     const cfg = loadUserConfig();
     // Broadcast to every open window so all surfaces live-apply the new prefs.
     for (const win of BrowserWindow.getAllWindows()) {

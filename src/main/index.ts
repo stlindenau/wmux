@@ -696,7 +696,11 @@ app.whenReady().then(() => {
         // Re-read ~/.wmux/config.toml and live-apply to every open window.
         (async () => {
           try {
-            const { loadUserConfig } = await import('./user-config');
+            const { loadUserConfig, resetConfigWarnings } = await import('./user-config');
+            // An explicit reload means the user is iterating on the file, so
+            // re-report whatever is still wrong with it rather than staying quiet
+            // about a problem already warned about before their edit.
+            resetConfigWarnings();
             const cfg = loadUserConfig();
             for (const win of BrowserWindow.getAllWindows()) {
               if (!win.isDestroyed()) {
