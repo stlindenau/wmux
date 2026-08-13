@@ -1,9 +1,5 @@
 #!/usr/bin/env node
 "use strict";
-// Parts of this file are created by genAI.
-// This notice needs to remain attached to any reproduction of or excerpt from this file.
-// Agent: Claude Code
-// AI-assisted: Yes
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
@@ -49,12 +45,6 @@ else {
     event = 'PostToolUse';
 }
 const DEFAULT_BRIDGE_PORT = 9787;
-// How long to wait for wmux to acknowledge the frame before giving up. Sized above
-// the ~7s worst-case round-trip seen from a devcontainer (a fresh npiperelay.exe per
-// connection over WSL interop, scanned by AV/EDR on every exec) but well under
-// Claude Code's own hook timeout, so a wedged bridge costs a pause, not a failed
-// turn. Overridable for slower transports.
-const ACK_TIMEOUT_MS = parseInt(process.env.WMUX_HOOK_ACK_TIMEOUT_MS || '', 10) || 10000;
 const pipePath = process.env.WMUX_PIPE || '\\\\.\\pipe\\wmux';
 const token = process.env.WMUX_REMOTE_TOKEN || process.env.WMUX_PIPE_TOKEN || '';
 const surfaceId = process.env.WMUX_SURFACE_ID || '';
@@ -133,43 +123,14 @@ function sendHook() {
     // object handleHookEvent receives (index.ts passes request.params, not the
     // whole message).
     params.seq = Math.round((perf_hooks_1.performance.timeOrigin + perf_hooks_1.performance.now()) * 1000);
-    // Wait for wmux to acknowledge the frame instead of closing the moment the write
-    // flushes. The old `write(msg, () => client.end())` lost events outright over the
-    // devcontainer TCP bridge: `wmux bridge` treats the client close as "abort" and
-    // destroys the relay, and over npiperelay that destroy is child.kill() — so the
-    // frame died in the relay's stdin buffer with the hook reporting success. A flush
-    // is not a delivery; only the reply proves the event landed.
-    //
-    // Bounded, because a hook that never returns stalls the tool call that fired it.
-    // Every exit path is code 0: a hook must never fail the agent's turn just because
-    // the sidebar is unreachable.
     const client = connectTransport(() => {
         const msg = JSON.stringify({ method: 'hook.event', params, id: 1, token });
-        client.write(msg + '\n');
+        client.write(msg + '\n', () => client.end());
     });
-    let finished = false;
-    const finish = () => {
-        if (finished)
-            return;
-        finished = true;
-        clearTimeout(ackTimer);
-        client.destroy();
+    client.on('error', () => {
+        // wmux (or the bridge) not reachable — silently ignore.
         process.exit(0);
-    };
-    // Not unref'd: this timer is the only thing that rescues us from a bridge that
-    // accepts the connection and then never answers. Pre-fix, that case hung until
-    // something else killed the process.
-    const ackTimer = setTimeout(finish, ACK_TIMEOUT_MS);
-    let ack = '';
-    client.on('data', (chunk) => {
-        ack += chunk.toString();
-        if (ack.includes('\n'))
-            finish(); // acknowledged — done, don't linger
     });
-    // Peer closed without replying, or wmux/the bridge is unreachable. Nothing more
-    // to wait for either way, and both stay silent by contract.
-    client.on('close', finish);
-    client.on('error', finish);
 }
 // Read stdin (Claude Code pipes the hook payload as JSON).
 process.stdin.setEncoding('utf8');

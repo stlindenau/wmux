@@ -63,18 +63,25 @@ describe('wmux-hook ack handling', () => {
 
   it('holds the socket open until the reply arrives, then exits at once', async () => {
     let frame = '';
+    let replied = false;
     let closedEarly = false;
     const REPLY_DELAY_MS = 800;
 
     const port = await listen((sock) => {
-      // The regression: pre-fix the hook half-closed as soon as the write flushed,
-      // so this fired before the reply was ever written. That close is what made
-      // `wmux bridge` tear down a still-draining relay.
-      sock.on('end', () => { if (!frame) closedEarly = true; });
+      // The regression, stated as the peer sees it: the hook must not half-close
+      // before it has been answered. Gate on `replied`, not on whether the frame
+      // arrived — TCP delivers the bytes ahead of the FIN, so the frame is always
+      // there by the time 'end' fires and testing for it would pass either way.
+      // Pre-fix the hook end()ed the moment the write flushed; that close is what
+      // made `wmux bridge` tear down a still-draining relay.
+      sock.on('end', () => { if (!replied) closedEarly = true; });
       sock.on('data', (d) => {
         frame += d.toString();
         if (!frame.includes('\n')) return;
-        setTimeout(() => sock.write(JSON.stringify({ result: {}, id: 1 }) + '\n'), REPLY_DELAY_MS);
+        setTimeout(() => {
+          replied = true;
+          sock.write(JSON.stringify({ result: {}, id: 1 }) + '\n');
+        }, REPLY_DELAY_MS);
       });
     });
 
