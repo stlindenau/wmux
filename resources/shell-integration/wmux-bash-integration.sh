@@ -69,15 +69,78 @@ _wmux_preexec() {
     _wmux_report "report_shell_state $surface_id running"
 }
 
+# --- Startup commands (the WSL half of WMUX_STARTUP_COMMANDS) ----------------
+#
+# wmux passes a pane's `cd` and any quick-launch commands in WMUX_STARTUP_B64
+# rather than typing them at the prompt, so they leave no echoed line above it.
+# Base64 because the value crosses WSLENV, and the commands contain spaces,
+# quotes and `&&`.
+#
+# Captured HERE, at source time, but run from the first precmd — those are
+# deliberately different moments:
+#
+#  - Running at the first prompt is the only point after EVERY rc file, so a
+#    /etc/profile that cds to $HOME cannot undo the pane's directory. This is
+#    what `wsl.exe --cd` cannot promise.
+#  - Acking here, while the script is still being sourced, is the only point
+#    that is reliably reached. wmux gives up waiting once the pane falls silent
+#    and types the commands itself; a startup command that enters a container
+#    never returns to a prompt, so an ack deferred until after it ran would
+#    arrive too late — and wmux would launch the container a second time.
+if [ -z "${WMUX_STARTUP_CONSUMED}" ]; then
+    # NOT exported, and never should be: the devcontainer launcher runs
+    # `devcontainer exec … -- env <WMUX_*> bash -i`, and the container sources
+    # its own copy of this script. A payload that reached the child would have
+    # it relaunch the container from inside the container, without end.
+    _wmux_startup_pending=""
+    if [ -n "${WMUX_STARTUP_B64}" ]; then
+        _wmux_startup_pending=$(printf '%s' "${WMUX_STARTUP_B64}" | base64 -d 2>/dev/null)
+        # Only ack a payload we actually hold. A missing or non-GNU `base64`
+        # leaves this empty, and staying silent is what makes wmux fall back to
+        # typing the commands — the pane still ends up in the right place.
+        if [ -n "$_wmux_startup_pending" ]; then
+            printf '\033]7717;startup-consumed\007'
+        fi
+    fi
+    # Unconditional, and separate from the decode: whether or not we can run
+    # them, nothing downstream of this shell may inherit the payload.
+    unset WMUX_STARTUP_B64
+    export WMUX_STARTUP_CONSUMED=1
+fi
+
+_wmux_run_startup_commands() {
+    # $? belongs to whatever ran before the prompt. This hook is installed ahead
+    # of _wmux_precmd, which reads it to detect a Ctrl+C, so hand it through
+    # untouched on every path.
+    local _wmux_status=$?
+    [ -z "$_wmux_startup_pending" ] && return $_wmux_status
+    local _wmux_payload="$_wmux_startup_pending"
+    # Cleared BEFORE the eval, not after: a command that execs into a container
+    # or a new shell never comes back to clear it, and the next prompt would run
+    # the whole list again.
+    _wmux_startup_pending=""
+    local _wmux_line
+    # A here-string, never a pipe — bash runs the right-hand side of a pipe in a
+    # subshell, where `cd` would apply to a process that exits one line later.
+    while IFS= read -r _wmux_line; do
+        [ -z "$_wmux_line" ] && continue
+        eval "$_wmux_line"
+    done <<< "$_wmux_payload"
+    return $_wmux_status
+}
+
 # Install hooks
 if [ -n "$ZSH_VERSION" ]; then
     # Zsh: native preexec + precmd
     autoload -Uz add-zsh-hook
+    # Before _wmux_precmd, so the first report_pwd carries the directory the
+    # startup `cd` landed in rather than the one it is about to leave.
+    add-zsh-hook precmd _wmux_run_startup_commands
     add-zsh-hook precmd _wmux_precmd
     add-zsh-hook preexec _wmux_preexec
 elif [ -n "$BASH_VERSION" ]; then
     # Bash: DEBUG trap as preexec, PROMPT_COMMAND as precmd
     _wmux_bash_preexec_active=0
     trap '_wmux_bash_preexec_active=1; _wmux_preexec' DEBUG
-    PROMPT_COMMAND="_wmux_precmd; _wmux_bash_preexec_active=0${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+    PROMPT_COMMAND="_wmux_run_startup_commands; _wmux_precmd; _wmux_bash_preexec_active=0${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
 fi

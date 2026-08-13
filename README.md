@@ -350,9 +350,10 @@ notify <surface_id> <text>
 ping
 ```
 
-`report_startup_command` is replayed as keystrokes into a freshly spawned shell,
-whose working directory is not guaranteed (a WSL distro's login rc can discard
-`wsl.exe --cd` — see `[wsl] enforce-cwd` in [docs/config.md](docs/config.md)).
+`report_startup_command` is replayed into a freshly spawned shell — from its own
+init where the shell integration is available, otherwise as keystrokes — and its
+working directory is not guaranteed (a WSL distro's login rc can discard
+`wsl.exe --cd`; see [docs/config.md](docs/config.md#wsl-working-directory)).
 Send a cwd-independent command: an absolute path, or one that opens with its own
 `cd`.
 

@@ -6,7 +6,6 @@ import { v4 as uuidv4 } from 'uuid';
 import { SurfaceId } from '../shared/types';
 import { getPipePath, readPipeToken } from '../shared/instance';
 import { isPosixPath } from '../shared/paths';
-import { loadUserConfig, UserConfig } from './user-config';
 import { PtyLedger } from './pty-ledger';
 
 // ─── Shell resolution ──────────────────────────────────────────────────────
@@ -189,24 +188,6 @@ function quotePosix(p: string): string {
   return `'${p.split("'").join("'\\''")}'`;
 }
 
-// The `[wsl] enforce-cwd` lookup behind an object so a test can substitute the
-// config without writing to the real ~/.wmux/config.toml. Read per pane create
-// rather than cached: the file is small, create() is a user-driven action, and
-// a pane spawned after an edit then picks the new value up on its own, with no
-// `wmux reload-config` in between.
-//
-// Defaults to enforcing. On a distro where --cd already holds, the cost is one
-// echoed `cd` line above the first prompt; where it doesn't, the cost of the
-// other default is every pane opening in the wrong directory.
-interface WslCwdPolicy {
-  load: () => UserConfig;
-  enforce: () => boolean;
-}
-export const wslCwdPolicy: WslCwdPolicy = {
-  load: () => loadUserConfig(),
-  enforce: () => wslCwdPolicy.load().wsl?.enforceCwd ?? true,
-};
-
 /**
  * The `cd` a freshly spawned WSL pane has to be told explicitly, or null when
  * none is needed.
@@ -215,8 +196,14 @@ export const wslCwdPolicy: WslCwdPolicy = {
  * shell reads its rc, so on a distro whose /etc/profile or ~/.profile cds to
  * $HOME — a common corporate setup — it is silently overwritten and every
  * pane, fresh or restored, opens in the home directory instead of the project.
- * A command typed after the shell is up is the one channel the rc cannot
- * override, so synthesize one and let the caller send it.
+ * A command the shell itself runs after its rc is the one channel the rc cannot
+ * override, so synthesize one.
+ *
+ * Unconditional, with no opt-out. It used to be governed by `[wsl] enforce-cwd`,
+ * whose entire purpose was to buy back the one echoed `cd` line the command cost
+ * when it was typed at the prompt — see wslStartupPayload, which no longer types
+ * it. What is left of the knob is a way to break every pane's directory on
+ * exactly the distros this exists for.
  *
  * WSL only: pwsh/cmd get a real Win32 working directory from resolveSpawnCwd,
  * and an 'unknown' spec may be a remote command line (`ssh user@host`) where a
@@ -228,9 +215,147 @@ export function wslCdCommand(
 ): string | null {
   if (shellType !== 'wsl') return null;
   if (!cwd || !isPosixPath(cwd)) return null;
-  if (!wslCwdPolicy.enforce()) return null;
   return `cd ${quotePosix(cwd)}`;
 }
+
+// ─── WSL startup-command init channel ──────────────────────────────────────
+//
+// The env var carrying a WSL pane's init-time command list into the distro.
+export const WSL_STARTUP_ENV = 'WMUX_STARTUP_B64';
+
+/**
+ * The commands a WSL pane should run inside its own init, or null when there
+ * are none: the `cd` from wslCdCommand first, then any quick-launch profile
+ * command or replayed `report_startup_command`.
+ *
+ * Handing them to the shell instead of typing them is what stops them being
+ * echoed above the first prompt — the same trick PowerShell already gets via
+ * WMUX_STARTUP_COMMANDS, which is why that one is not base64. This value has to
+ * survive WSLENV, which copies the Win32 environment block into the distro: a
+ * newline in an env value is not something the interop layer documents as safe,
+ * and the commands routinely contain spaces, single quotes, `;` and `&&`.
+ * Base64 is a single line of [A-Za-z0-9+/=] — nothing WSLENV, cmd.exe quoting or
+ * the shell can chew on. Node's toString('base64') never wraps.
+ *
+ * Order matters and matches the order the renderer used to type them: a restore
+ * command has to find itself in the pane's directory, not in $HOME.
+ */
+export function wslStartupPayload(
+  cwdCommand: string | undefined,
+  startupCommands: string[],
+): string | null {
+  const lines = [...(cwdCommand ? [cwdCommand] : []), ...startupCommands];
+  if (lines.length === 0) return null;
+  return Buffer.from(lines.join('\n'), 'utf8').toString('base64');
+}
+
+/**
+ * In-band "I have the startup commands, don't type them" ack, emitted by
+ * wmux-bash-integration.sh while it is still being sourced.
+ *
+ * An OSC rather than a V1 pipe report because a plain WSL pane's only route back
+ * to wmux is npiperelay.exe or a `wmux bridge`, and neither is guaranteed to be
+ * there — _wmux_report's "native" temp-file branch has no reader in main at all.
+ * An ack that can be lost, combined with the timeout below, would type commands
+ * the shell has already run: for a devcontainer pane that means launching the
+ * container twice. The PTY is the one channel that cannot be missing.
+ *
+ * 7717 is unclaimed: xterm core handles 0/1/2/4/8/10-12/52/104/110-112, the image
+ * addon owns 1337, and useTerminal registers 9, 99, 777 and 52. An OSC nobody
+ * registered is swallowed by the parser, never rendered.
+ */
+export const STARTUP_ACK = '\x1b]7717;startup-consumed\x07';
+
+/** True when `chunk`, joined to the tail kept from the previous chunk, holds the ack. */
+export function containsStartupAck(prevTail: string, chunk: string): boolean {
+  return (prevTail + chunk).includes(STARTUP_ACK);
+}
+
+/** The trailing bytes of `chunk` that could still be the head of a split ack. */
+export function ackTail(chunk: string): string {
+  return chunk.slice(-(STARTUP_ACK.length - 1));
+}
+
+/**
+ * Decides when to give up waiting for the ack and type the commands after all.
+ *
+ * Not a fixed delay from spawn: a cold WSL distro can take many seconds to reach
+ * ~/.bashrc, so a short timer fires before the shell exists and a long one makes
+ * the no-integration case feel broken. Wait for quiescence instead — nothing at
+ * all until the PTY's first byte, then restart the window on every chunk, so it
+ * only expires once the shell has gone quiet, i.e. is sitting at a prompt.
+ *
+ * That is causally safe rather than timing-lucky: the integration script acks
+ * while the rc is still being sourced, which is strictly before the first prompt,
+ * which is strictly before quiescence. The cap covers a shell that streams
+ * forever and never idles.
+ */
+export interface StartupFallback {
+  /** Feed one chunk of PTY output. Arms on the first call, re-arms on each one. */
+  onData(): void;
+  /** The shell acked, or another caller took ownership — never fire. */
+  cancel(): void;
+}
+
+export function createStartupFallback(opts: {
+  onFire: () => void;
+  quiescenceMs?: number;
+  capMs?: number;
+}): StartupFallback {
+  const quiescenceMs = opts.quiescenceMs ?? 1200;
+  const capMs = opts.capMs ?? 15000;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let capTimer: ReturnType<typeof setTimeout> | null = null;
+  let done = false;
+
+  const fire = (): void => {
+    if (done) return;
+    done = true;
+    clear();
+    opts.onFire();
+  };
+  function clear(): void {
+    if (timer) { clearTimeout(timer); timer = null; }
+    if (capTimer) { clearTimeout(capTimer); capTimer = null; }
+  }
+
+  return {
+    onData(): void {
+      if (done) return;
+      // The cap runs from the first byte, not from spawn: before that there is
+      // no evidence a shell exists to type into.
+      if (!capTimer) capTimer = setTimeout(fire, capMs);
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(fire, quiescenceMs);
+    },
+    cancel(): void {
+      if (done) return;
+      done = true;
+      clear();
+    },
+  };
+}
+
+/**
+ * Propagate WMUX_* vars into the WSL distro (issue #60). Without WSLENV, WSL
+ * strips every Windows env var, so the notification framework, sidebar and
+ * `wmux` CLI inside WSL can't reach the host. /u = pass through, /up = pass
+ * through AND translate the Windows path to a WSL mount (/mnt/c/...).
+ *
+ * WMUX_REMOTE/WMUX_REMOTE_TOKEN must travel too (issue #78): a WSL pane cannot
+ * open a Windows named pipe, so the CLI and shell integration reach wmux over
+ * the TCP bridge instead — without these two the pane silently reports nothing
+ * until the user exports them by hand.
+ *
+ * WMUX_STARTUP_B64 is /u and must stay /u: it is base64, not a path. /p or /l
+ * would have the interop layer rewrite it, and /l would split it on separators.
+ * Listing a name whose variable is unset is free — WSLENV skips it — so this can
+ * be built here even though the value is only set later, in create().
+ */
+export const WMUX_WSLENV =
+  'WMUX/u:WMUX_SURFACE_ID/u:WMUX_CLI/up:WMUX_PIPE/u:WMUX_PIPE_TOKEN/u:WMUX_INTEGRATION/u'
+  + ':WMUX_REMOTE/u:WMUX_REMOTE_TOKEN/u'
+  + `:${WSL_STARTUP_ENV}/u`;
 
 // Build the launch args for a shell and mutate `env` with shell-specific vars.
 // Kept out of create() so that hot path stays under the cognitive-complexity
@@ -255,18 +380,7 @@ function buildShellArgs(
   }
   if (shellType === 'wsl') {
     env.WMUX_INTEGRATION = '1';
-    // Propagate WMUX_* vars into the WSL distro (issue #60). Without WSLENV, WSL
-    // strips every Windows env var, so the notification framework, sidebar and
-    // `wmux` CLI inside WSL can't reach the host. /u = pass through, /up = pass
-    // through AND translate the Windows path to a WSL mount (/mnt/c/...).
-    // WMUX_REMOTE/WMUX_REMOTE_TOKEN must travel too (issue #78): a WSL pane
-    // cannot open a Windows named pipe, so the CLI and shell integration reach
-    // wmux over the TCP bridge instead — without these two the pane silently
-    // reports nothing until the user exports them by hand.
-    const wmuxWslEnv =
-      'WMUX/u:WMUX_SURFACE_ID/u:WMUX_CLI/up:WMUX_PIPE/u:WMUX_PIPE_TOKEN/u:WMUX_INTEGRATION/u'
-      + ':WMUX_REMOTE/u:WMUX_REMOTE_TOKEN/u';
-    env.WSLENV = env.WSLENV ? `${env.WSLENV}:${wmuxWslEnv}` : wmuxWslEnv;
+    env.WSLENV = env.WSLENV ? `${env.WSLENV}:${WMUX_WSLENV}` : WMUX_WSLENV;
     // A restored WSL/POSIX cwd (issue #60) can't be a Win32 process cwd (error
     // 267). Open it INSIDE the distro via --cd instead; the Win32-side cwd is
     // sanitized to a valid Windows dir by the caller.
@@ -300,6 +414,15 @@ interface PtyEntry {
   // when create() is called again for the same surfaceId (idempotent reuse).
   shell: string;
   startupConsumed: boolean;
+  /** Startup commands were handed to the shell's own init (WSL/PowerShell). */
+  initChannel: boolean;
+  /**
+   * Types the startup commands if the shell never acks having them. Present only
+   * while that is still undecided; see createStartupFallback.
+   */
+  startupFallback?: StartupFallback;
+  /** Trailing bytes of the previous PTY chunk, in case the ack was split across two. */
+  startupAckTail: string;
 }
 
 export interface CreateOptions {
@@ -329,8 +452,17 @@ export interface CreateResult {
    * pane's login rc would otherwise discard `wsl.exe --cd` (see wslCdCommand).
    * Absent for every other shell type, and for a reused PTY — that one is
    * already sitting where it was put.
+   *
+   * Absent as well when `initChannel` is set — the shell runs it itself.
    */
   cwdCommand?: string;
+  /**
+   * The shell was given its startup commands (and `cwdCommand`) to run inside
+   * its own init, so the caller must type nothing. Where a shell might not
+   * cooperate — a WSL distro that never sources the integration script — main
+   * types them itself after the pane goes quiet, still without the caller.
+   */
+  initChannel?: boolean;
 }
 
 // Primary Device Attributes (DA1). oh-my-posh / PSReadLine probe the terminal
@@ -391,6 +523,7 @@ export class PtyManager {
           shell: existing.shell,
           startupCommandsConsumed: existing.startupConsumed,
           reused: true,
+          initChannel: existing.initChannel,
         };
       }
     }
@@ -457,11 +590,35 @@ export class PtyManager {
       startupCommandsConsumed = true;
     }
 
-    // The WSL counterpart: there is no profile to bake anything into, and the
-    // distro's login rc may have cd'd away from --cd's directory, so the pane
-    // has to be told where it is. Sent by the caller, ahead of any startup
-    // command, once the shell is up — see wslCdCommand.
-    const cwdCommand = wslCdCommand(shellType, options.cwd) ?? undefined;
+    // A WSL pane has one more command to run than any other: the distro's login
+    // rc may have cd'd away from --cd's directory, so the pane has to be told
+    // where it is (see wslCdCommand). It goes first — a restore command has to
+    // find itself in the project, not in $HOME.
+    let cwdCommand = wslCdCommand(shellType, options.cwd) ?? undefined;
+
+    // The WSL counterpart to WMUX_STARTUP_COMMANDS. There is no profile to bake
+    // anything into, so the list travels as base64 in the environment and
+    // wmux-bash-integration.sh runs it from the shell's first precmd — after
+    // every rc file, so a /etc/profile that cds to $HOME cannot undo it.
+    //
+    // Unlike PowerShell this is not a promise: wmux installs no rc hook inside a
+    // distro, so nothing here proves the integration script will be sourced.
+    // Hence `fallbackLines` and the timer below, which reproduce exactly what
+    // the renderer used to do when the shell turns out not to cooperate.
+    let initChannel = false;
+    let fallbackLines: string[] = [];
+    if (shellType === 'wsl') {
+      const payload = wslStartupPayload(cwdCommand, startupCommands);
+      if (payload) {
+        env[WSL_STARTUP_ENV] = payload;
+        fallbackLines = [...(cwdCommand ? [cwdCommand] : []), ...startupCommands];
+        startupCommandsConsumed = true;
+        initChannel = true;
+        // Owned by the init channel now. Leaving it set would have the caller
+        // type the `cd` on top of the shell having already run it.
+        cwdCommand = undefined;
+      }
+    }
 
     // CreateProcess fails with error 267 (ERROR_DIRECTORY) when the working dir
     // isn't a real directory, and node-pty surfaces that as an opaque "Cannot
@@ -508,7 +665,23 @@ export class PtyManager {
       rows: spawnOptions.rows ?? 24,
       shell,
       startupConsumed: startupCommandsConsumed,
+      initChannel,
+      startupAckTail: '',
     };
+
+    if (initChannel && fallbackLines.length > 0) {
+      entry.startupFallback = createStartupFallback({
+        onFire: () => {
+          entry.startupFallback = undefined;
+          if (!entry.alive) return;
+          console.warn(
+            `[wmux] ${id}: no shell-integration ack for the startup commands — typing them instead.`
+            + ' Source wmux-bash-integration.sh in the distro to run them silently.',
+          );
+          for (const line of fallbackLines) this.write(id, `${line}\r`);
+        },
+      });
+    }
 
     ptyProcess.onData((data) => {
       // Answer DA1 probes in-process so the prompt never stalls or leaks the
@@ -517,6 +690,18 @@ export class PtyManager {
       if (entry.alive && data.indexOf('\x1b[') !== -1 && DA1_QUERY.test(data)) {
         try { ptyProcess.write(DA1_REPLY); } catch { /* pty disposed between events */ }
       }
+      // Before the fan-out, so the decision is made on the same bytes the
+      // renderer is about to see — and so a listener that throws cannot leave
+      // the fallback armed against a shell that already ran the commands.
+      if (entry.startupFallback) {
+        if (containsStartupAck(entry.startupAckTail, data)) {
+          entry.startupAckTail = '';
+          this.cancelStartupFallback(id);
+        } else {
+          entry.startupAckTail = ackTail(data);
+          entry.startupFallback.onData();
+        }
+      }
       for (const listener of entry.dataListeners) {
         listener(data);
       }
@@ -524,6 +709,8 @@ export class PtyManager {
 
     ptyProcess.onExit(({ exitCode }) => {
       entry.alive = false; // stops any in-flight chunked write
+      entry.startupFallback?.cancel();
+      entry.startupFallback = undefined;
       if (typeof ptyProcess.pid === 'number') this.ledger?.remove(ptyProcess.pid);
       for (const listener of entry.exitListeners) {
         listener(exitCode);
@@ -538,7 +725,22 @@ export class PtyManager {
     }
 
     this.ptys.set(id, entry);
-    return { id, shell, startupCommandsConsumed, reused: false, cwdCommand };
+    return { id, shell, startupCommandsConsumed, reused: false, cwdCommand, initChannel };
+  }
+
+  /**
+   * Stop waiting for the shell integration's ack: never type the startup
+   * commands into this pane. A no-op once the pane has acked, fired or exited.
+   *
+   * Public because the fallback is not the only clock. AgentManager writes its
+   * own `cd` synchronised to the prompt it detects; without this, the two can
+   * cross and the pane runs the same command twice.
+   */
+  cancelStartupFallback(id: SurfaceId): void {
+    const entry = this.ptys.get(id);
+    if (!entry?.startupFallback) return;
+    entry.startupFallback.cancel();
+    entry.startupFallback = undefined;
   }
 
   write(id: SurfaceId, data: string): void {
@@ -615,6 +817,8 @@ export class PtyManager {
     if (!entry) return;
 
     entry.alive = false; // signals any in-flight chunked write to stop
+    entry.startupFallback?.cancel();
+    entry.startupFallback = undefined;
     const pid = entry.pty.pid;
 
     // Tree-kill the shell's whole process subtree BEFORE closing the pseudoconsole

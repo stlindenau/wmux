@@ -53,10 +53,6 @@ palette = [
 "ctrl+k"       = "<C-k><Delete>"   # kill to end of line, then pull the next line up
 "ctrl+alt+r"   = "clear<CR>"
 "ctrl+shift+q" = ""                # empty value = swallow the key
-
-[wsl]
-# Type an explicit `cd` in WSL panes (see "WSL working directory" below).
-enforce-cwd = true
 ```
 
 ## Key remaps
@@ -99,10 +95,8 @@ Notes:
 
 ## WSL working directory
 
-```toml
-[wsl]
-enforce-cwd = true   # default
-```
+Nothing to configure here — this section explains what wmux does on its own, and
+the one thing you have to do in the distro for it to be seamless.
 
 When wmux opens a WSL pane in a directory — a new tab, a split, or a pane
 restored from the last session — it passes that directory to `wsl.exe --cd`.
@@ -115,27 +109,51 @@ managed/corporate images) silently discards it:
 > wsl --cd /tmp            # interactive login: ~         — the rc wins
 ```
 
-The pane then opens in the home directory instead of the project, and anything
-replayed into it — a quick-launch startup command, a restored session's command
-— runs in the wrong place.
+The pane would then open in the home directory instead of the project, and
+anything replayed into it — a quick-launch startup command, a restored session's
+command — would run in the wrong place.
 
-With `enforce-cwd` on (the default), wmux additionally types a `cd '<dir>'` into
-the pane once its shell is up, which is the one channel the rc cannot override.
-`--cd` is still passed, so on a distro that honours it the first prompt is
-already correct and the `cd` is a no-op.
+So wmux also sends the pane an explicit `cd '<dir>'`, plus any startup commands,
+through the shell's own initialization rather than as keystrokes: they arrive
+base64-encoded in `WMUX_STARTUP_B64`, and `wmux-bash-integration.sh` runs them
+from the shell's first prompt hook. That is **after every rc file**, so the rc
+cannot override it — and because nothing is typed at the prompt, nothing is
+echoed above it. `--cd` is still passed, so on a distro that honours it the pane
+is already in the right place and the `cd` is a no-op.
 
-Set `enforce-cwd = false` if your distro honours `--cd` and you would rather not
-see the extra `cd` line above the first prompt.
+### Sourcing the integration script
+
+wmux installs no rc hook inside a distro, so this only works once you source the
+script yourself. It ships at `resources/shell-integration/wmux-bash-integration.sh`
+in your wmux install, which WSL reaches under `/mnt/c/...`. Add to `~/.bashrc`
+(or `~/.zshrc`), with the path to your own install:
+
+```sh
+WMUX_SH=/mnt/c/Users/<you>/wmux/resources/shell-integration/wmux-bash-integration.sh
+[ -n "$WMUX_INTEGRATION" ] && [ -f "$WMUX_SH" ] && . "$WMUX_SH"
+```
+
+The `$WMUX_INTEGRATION` guard is what keeps the script out of shells wmux did
+not start — wmux sets it (along with `WMUX_SURFACE_ID`, `WMUX_CLI` and friends)
+only in the panes it spawns.
+
+Without this, wmux waits for the pane to fall silent and then **types** the
+commands instead — the pane still lands in the right directory, you just see the
+`cd` line above the first prompt, and the console logs a one-line warning.
 
 Notes:
 
 - WSL panes only. PowerShell and cmd panes get a real Win32 working directory,
-  which Windows does not let an rc file take away.
-- The value is read when a pane is created, so a new pane picks up an edit
-  without `wmux reload-config`. Panes that are already open keep their
-  directory either way.
+  which Windows does not let an rc file take away; PowerShell has had the
+  equivalent init-time path via `WMUX_STARTUP_COMMANDS` all along.
+- Panes that are already open keep their directory; this applies at pane
+  creation.
 - The real fix, where you control the image, is to stop the login rc from
-  changing directory — then `--cd` works on its own and this flag is moot.
+  changing directory — then `--cd` works on its own and none of this is needed.
+- Removed after 0.44.0: the `[wsl] enforce-cwd` option. It existed only to suppress
+  the echoed `cd` line, which no longer happens; setting it to `false` on a
+  distro whose rc discards `--cd` just put every pane in `$HOME`. An
+  `enforce-cwd` left in your config is ignored, not an error.
 
 ## Precedence
 

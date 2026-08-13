@@ -133,35 +133,22 @@ describe('loadUserConfig', () => {
     expect(out.browser).toBeUndefined();
   });
 
-  it('maps the [wsl] section: enforce-cwd', () => {
+  // `[wsl] enforce-cwd` was removed once startup commands began running inside
+  // the shell's own init: the option existed only to suppress the echoed `cd`
+  // line, and on the distros the `cd` is there for, turning it off just put
+  // every pane in $HOME. A stale one left in a config file must be inert.
+  it('ignores a leftover [wsl] enforce-cwd without complaining', () => {
     tmpPath = writeTmp(`
       [wsl]
       enforce-cwd = false
-    `);
-    const out = loadUserConfig(tmpPath);
-    expect(out.errors).toEqual([]);
-    expect(out.wsl?.enforceCwd).toBe(false);
-  });
 
-  it('accepts the camelCase wsl key', () => {
-    tmpPath = writeTmp(`
-      [wsl]
-      enforceCwd = true
-    `);
-    expect(loadUserConfig(tmpPath).wsl?.enforceCwd).toBe(true);
-  });
-
-  // Absent section and a non-boolean value both leave the key undefined, so the
-  // caller's own default (enforce) applies — a typo must not silently opt out.
-  it('leaves wsl undefined when the section is absent or the value is not a bool', () => {
-    tmpPath = writeTmp(`
       [terminal]
       font-size = 13
     `);
-    expect(loadUserConfig(tmpPath).wsl).toBeUndefined();
-
-    fs.writeFileSync(tmpPath, '[wsl]\nenforce-cwd = "yes"\n', 'utf-8');
-    expect(loadUserConfig(tmpPath).wsl).toBeUndefined();
+    const out = loadUserConfig(tmpPath);
+    expect(out.errors).toEqual([]);
+    expect(out.terminal?.fontSize).toBe(13);
+    expect(out).not.toHaveProperty('wsl');
   });
 
   // Issue #146 — `[keys]` remaps: the config file is the plugin-shaped ask,

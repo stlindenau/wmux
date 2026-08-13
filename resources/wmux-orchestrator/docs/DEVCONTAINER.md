@@ -113,13 +113,14 @@ discards it:
 > wsl --cd /tmp            # interactive login: ~         — the rc wins
 ```
 
-wmux compensates by typing an explicit `cd` into the pane once its shell is up
-(`[wsl] enforce-cwd`, on by default — see `docs/config.md`). But that only
-covers directories wmux knows about, and a user can switch it off, so:
+wmux compensates by sending the pane an explicit `cd` of its own — through the
+shell's init where the integration script is sourced, as keystrokes where it is
+not (see `docs/config.md`). But that only covers directories wmux knows about,
+so:
 
 > **A command sent via `report_startup_command` must be cwd-independent.**
 
-wmux replays it as keystrokes into a freshly spawned shell. A relative
+wmux replays it into a freshly spawned shell. A relative
 `./relaunch-my-container.sh` dies with "No such file or directory" the moment
 the pane comes up in the home directory, and the container is never re-entered.
 Report an absolute path, or open the command with its own `cd`:
@@ -131,9 +132,14 @@ _wmux_report "report_startup_command ${WMUX_SURFACE_ID} cd '/home/me/project' &&
 Expand the path where you *send* the report — inside the container, from
 whatever variable the launcher forwarded — so the stored command holds a
 literal host-side path and does not depend on the restored shell's environment.
-Single-quote it: it is typed at a prompt, so a space would split it and a `$`
-would expand. A redundant `cd` (wmux typed one, the command starts with
+Single-quote it: it is run as a shell line, so a space would split it and a `$`
+would expand. A redundant `cd` (wmux sends one, the command starts with
 another) is a harmless no-op; the two do not need to coordinate.
+
+Note that the command may now run from the shell's first `precmd` hook rather
+than being typed at the prompt — which changes nothing for a cwd-independent
+command, and is why one that reads the terminal's own input, or expects to see
+itself echoed, will not behave the same.
 
 Reporting the pane's cwd has the same requirement in reverse: `$(pwd)` inside a
 container is a container path that means nothing on the Windows/WSL side, so

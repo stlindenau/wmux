@@ -9,7 +9,13 @@ import {
   resolveShellForCwd,
   shellEnv,
   wslCdCommand,
-  wslCwdPolicy,
+  wslStartupPayload,
+  containsStartupAck,
+  ackTail,
+  createStartupFallback,
+  STARTUP_ACK,
+  WSL_STARTUP_ENV,
+  WMUX_WSLENV,
 } from '../../src/main/pty-manager';
 import type { SurfaceId } from '../../src/shared/types';
 
@@ -335,20 +341,15 @@ describe('resolveShellForCwd (POSIX cwd → WSL shell)', () => {
  *   > wsl --cd /tmp -- pwd     ->  /tmp        (non-interactive: --cd holds)
  *   > wsl --cd /tmp            ->  ~           (interactive login: rc wins)
  *
- * So the pane has to be told where it is, once its shell is up.
+ * So the pane has to be told where it is, by a command the shell runs itself
+ * after its rc (see wslStartupPayload).
  */
 describe('wslCdCommand (typed cd for WSL panes)', () => {
   const POSIX = '/home/user/agent/project';
 
-  // An empty config — i.e. the default, with no ~/.wmux/config.toml at all.
-  beforeEach(() => {
-    vi.spyOn(wslCwdPolicy, 'load').mockReturnValue({});
-  });
-  afterEach(() => vi.restoreAllMocks());
-
-  it('synthesizes a quoted cd for a WSL pane with a POSIX cwd, by default', () => {
-    // A pane in the wrong directory is worse than an echoed `cd` line, so this
-    // is on unless the user opts out.
+  it('synthesizes a quoted cd for a WSL pane with a POSIX cwd', () => {
+    // Unconditional since `[wsl] enforce-cwd` was removed: the option only ever
+    // bought back the echoed `cd` line, which the init channel already removes.
     expect(wslCdCommand('wsl', POSIX)).toBe(`cd '${POSIX}'`);
   });
 
@@ -376,13 +377,180 @@ describe('wslCdCommand (typed cd for WSL panes)', () => {
     expect(wslCdCommand('unknown', POSIX)).toBeNull();
   });
 
-  it('types nothing when [wsl] enforce-cwd = false', () => {
-    vi.spyOn(wslCwdPolicy, 'load').mockReturnValue({ wsl: { enforceCwd: false } });
-    expect(wslCdCommand('wsl', POSIX)).toBeNull();
+  it('does not consult the user config at all', () => {
+    // Regression guard for the reverted `[wsl] enforce-cwd`. Reading the config
+    // here also meant a disk read per pane spawn; if that import comes back,
+    // this fails before anyone has to rediscover why it was a bad idea.
+    const src = fs.readFileSync(
+      path.join(__dirname, '../../src/main/pty-manager.ts'), 'utf-8',
+    );
+    expect(src).not.toMatch(/loadUserConfig|enforceCwd/);
+  });
+});
+
+/**
+ * The WSL half of WMUX_STARTUP_COMMANDS: a pane's `cd` and startup commands
+ * handed to the shell's own init instead of typed at its prompt, so nothing is
+ * echoed above the first prompt.
+ *
+ * The payload's job is to survive WSLENV — which copies the Win32 environment
+ * block into the distro — and then a round trip through `base64 -d` and `eval`.
+ */
+describe('wslStartupPayload (WSL init-channel transport)', () => {
+  const decode = (b64: string): string[] =>
+    Buffer.from(b64, 'base64').toString('utf-8').split('\n');
+
+  it('puts the cd first, then the startup commands', () => {
+    // Order is the whole point for a restored devcontainer pane: its launcher
+    // has to find itself in the project, not in $HOME.
+    const payload = wslStartupPayload("cd '/w/proj'", ['./launch.sh', 'echo hi']);
+    expect(decode(payload!)).toEqual(["cd '/w/proj'", './launch.sh', 'echo hi']);
   });
 
-  it('honours an explicit enforce-cwd = true', () => {
-    vi.spyOn(wslCwdPolicy, 'load').mockReturnValue({ wsl: { enforceCwd: true } });
-    expect(wslCdCommand('wsl', POSIX)).toBe(`cd '${POSIX}'`);
+  it('carries either half alone', () => {
+    expect(decode(wslStartupPayload("cd '/w'", [])!)).toEqual(["cd '/w'"]);
+    expect(decode(wslStartupPayload(undefined, ['nvim'])!)).toEqual(['nvim']);
+  });
+
+  it('is null when there is nothing to run, so no env var is set', () => {
+    expect(wslStartupPayload(undefined, [])).toBeNull();
+  });
+
+  it('round-trips quoting, && and ; intact', () => {
+    // The real devcontainer case, verbatim: report_startup_command sends this
+    // whole line, and a single mangled character means the container is never
+    // re-entered.
+    const cmd = "cd '/workspaces/my proj' && .devcontainer/launch.sh; echo $?";
+    expect(decode(wslStartupPayload(undefined, [cmd])!)).toEqual([cmd]);
+  });
+
+  it('emits nothing WSLENV or a shell could chew on', () => {
+    // This is why it is base64 and not the raw newline-joined string PowerShell
+    // gets: WSLENV splits on `:`, and a newline in a Win32 environment value is
+    // not documented as safe. Base64 is one line of [A-Za-z0-9+/=].
+    const payload = wslStartupPayload(
+      "cd '/home/user/o'\\''brien/my proj'",
+      ["run --flag='a b' && next; done", 'echo "$HOME"'],
+    )!;
+    expect(payload).toMatch(/^[A-Za-z0-9+/]+={0,2}$/);
+  });
+
+  it('is listed in WSLENV as /u — never /p or /l', () => {
+    // /l would split the payload on separators and /p would have the interop
+    // layer rewrite it as a path. Either corrupts it silently.
+    // Anchored on both sides: `/up` starts with `/u`, so `toContain` alone
+    // would pass on exactly the flag this rules out.
+    expect(WMUX_WSLENV).toMatch(new RegExp(`(^|:)${WSL_STARTUP_ENV}/u(:|$)`));
+  });
+});
+
+/**
+ * The shell integration acks the payload over the PTY. ConPTY splits its output
+ * at arbitrary offsets, so the ack routinely arrives in two chunks — and a
+ * missed ack means the fallback types commands the shell already ran, which for
+ * a devcontainer pane launches the container a second time.
+ */
+describe('containsStartupAck (straddle-safe ack detection)', () => {
+  it('finds the ack inside ordinary output', () => {
+    expect(containsStartupAck('', `noise${STARTUP_ACK}more`)).toBe(true);
+  });
+
+  it('finds it at every possible split offset', () => {
+    for (let i = 1; i < STARTUP_ACK.length; i++) {
+      const first = `prompt$ ${STARTUP_ACK.slice(0, i)}`;
+      const second = `${STARTUP_ACK.slice(i)}rest`;
+      expect(containsStartupAck('', first)).toBe(false);
+      expect(containsStartupAck(ackTail(first), second)).toBe(true);
+    }
+  });
+
+  it('does not fire on output that merely resembles it', () => {
+    expect(containsStartupAck('', 'echo 7717;startup-consumed')).toBe(false);
+    expect(containsStartupAck('', '\x1b]7717;startup-pending\x07')).toBe(false);
+  });
+
+  it('keeps a tail short enough to never match on its own', () => {
+    expect(ackTail('x'.repeat(4096)).length).toBe(STARTUP_ACK.length - 1);
+  });
+});
+
+/**
+ * When the shell never acks — no integration script sourced, no `base64` — main
+ * types the commands after all, so the pane still lands in the right directory.
+ *
+ * Quiescence-driven rather than a fixed delay: a cold distro can take many
+ * seconds to reach ~/.bashrc, so a short timer fires into a shell that does not
+ * exist yet, and a long one makes the no-integration case feel broken.
+ */
+describe('createStartupFallback', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  const make = (onFire: () => void) =>
+    createStartupFallback({ onFire, quiescenceMs: 1200, capMs: 15000 });
+
+  it('stays disarmed until the PTY produces something', () => {
+    // Before the first byte there is no evidence a shell exists to type into.
+    const onFire = vi.fn();
+    make(onFire);
+    vi.advanceTimersByTime(60_000);
+    expect(onFire).not.toHaveBeenCalled();
+  });
+
+  it('fires once the pane falls silent', () => {
+    const onFire = vi.fn();
+    const fb = make(onFire);
+    fb.onData();
+    vi.advanceTimersByTime(1199);
+    expect(onFire).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(onFire).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-arms on every chunk, so a slow-booting distro is not cut off', () => {
+    const onFire = vi.fn();
+    const fb = make(onFire);
+    for (let i = 0; i < 10; i++) {
+      fb.onData();
+      vi.advanceTimersByTime(1000);
+    }
+    expect(onFire).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1200);
+    expect(onFire).toHaveBeenCalledTimes(1);
+  });
+
+  it('gives up at the cap when the pane never goes quiet', () => {
+    // A shell that streams forever would otherwise re-arm the timer for good.
+    const onFire = vi.fn();
+    const fb = make(onFire);
+    for (let i = 0; i < 100; i++) {
+      fb.onData();
+      vi.advanceTimersByTime(200);
+    }
+    expect(onFire).toHaveBeenCalledTimes(1);
+  });
+
+  it('never fires after cancel — the ack, or another writer, won', () => {
+    const onFire = vi.fn();
+    const fb = make(onFire);
+    fb.onData();
+    fb.cancel();
+    vi.advanceTimersByTime(60_000);
+    fb.onData();
+    vi.advanceTimersByTime(60_000);
+    expect(onFire).not.toHaveBeenCalled();
+  });
+
+  it('fires at most once, whatever happens afterwards', () => {
+    // At-most-once is the invariant that matters: firing twice means running a
+    // container launcher twice.
+    const onFire = vi.fn();
+    const fb = make(onFire);
+    fb.onData();
+    vi.advanceTimersByTime(1200);
+    fb.onData();
+    vi.advanceTimersByTime(60_000);
+    fb.cancel();
+    expect(onFire).toHaveBeenCalledTimes(1);
   });
 });

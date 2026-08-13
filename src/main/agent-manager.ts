@@ -55,6 +55,12 @@ export class AgentManager {
     const sendOnce = () => {
       if (commandSent) return;
       commandSent = true;
+      // Two clocks are watching this pane: the prompt detector below, and — for
+      // a WSL pane whose shell integration never acked — PtyManager's own
+      // quiescence timer, which would type the same startup commands. Whichever
+      // gets here first owns the pane; the other must stand down, or the agent's
+      // cwd is set twice and any restore command runs twice.
+      this.ptyManager.cancelStartupFallback(surfaceId);
       if (removeDataListener) removeDataListener();
       clearTimeout(fallbackTimer);
       if (promptDebounce) clearTimeout(promptDebounce);

@@ -618,6 +618,14 @@ export function useTerminal({ surfaceId, shell, cwd, visible = true, focused = t
       return true;
     });
 
+    // OSC 7717: the shell integration's "I have the startup commands, don't type
+    // them" ack. Consumed entirely in the main process, which is the only place
+    // that can still act on it; claim it here purely so it can never reach the
+    // screen. xterm already discards unregistered OSC sequences, so this is
+    // belt-and-braces — but a stray `7717;startup-consumed` printed above the
+    // first prompt would be the exact blemish this whole path exists to remove.
+    terminal.parser.registerOscHandler(7717, () => true);
+
     // Terminal bell (\x07) fallback (issue #53): many in-pane CLI agents —
     // including Claude Code's default "I'm waiting for you" signal — ring the
     // bell rather than emitting an OSC sequence or firing a hook. Surface it as
@@ -787,7 +795,17 @@ export function useTerminal({ surfaceId, shell, cwd, visible = true, focused = t
     // profile (that path is PowerShell-only), so it runs regardless of
     // `consumed`, and it goes FIRST — a restore command must find itself in the
     // pane's directory, not in $HOME.
-    const runStartupCommands = (id: string, consumed: boolean, cwdCommand?: string) => {
+    //
+    // `initChannel` means main handed the whole list — `cwdCommand` included —
+    // to the shell's own init and owns what happens if the shell ignores it.
+    // Typing anything here would duplicate commands the shell has already run.
+    const runStartupCommands = (
+      id: string,
+      consumed: boolean,
+      cwdCommand?: string,
+      initChannel?: boolean,
+    ) => {
+      if (initChannel) return;
       const cmds = [
         ...(cwdCommand ? [cwdCommand] : []),
         ...(consumed ? [] : startupCommandsRef.current ?? []),
@@ -831,12 +849,12 @@ export function useTerminal({ surfaceId, shell, cwd, visible = true, focused = t
         } else {
           // No existing PTY — create a new one, passing surfaceId so PTY ID = Surface ID
           window.wmux.pty.create({ shell: effectiveShell, cwd: cwd ?? '', env: {}, surfaceId, startupCommands: startupCommandsRef.current, cols: initialCols, rows: initialRows })
-            .then((created: { id: string; shell: string; startupCommandsConsumed?: boolean; cwdCommand?: string }) => {
+            .then((created: { id: string; shell: string; startupCommandsConsumed?: boolean; cwdCommand?: string; initChannel?: boolean }) => {
               // PTY persists (keep-alive); a remount re-attaches via pty.has.
               if (disposed) return;
               setResolvedShellForSurface(surfaceId, created.shell);
               attachToPty(created.id);
-              runStartupCommands(created.id, !!created.startupCommandsConsumed, created.cwdCommand);
+              runStartupCommands(created.id, !!created.startupCommandsConsumed, created.cwdCommand, created.initChannel);
             })
             .catch((err: unknown) => terminal.writeln(`\r\n\x1b[31m[failed to create PTY: ${err}]\x1b[0m`));
         }
@@ -844,11 +862,11 @@ export function useTerminal({ surfaceId, shell, cwd, visible = true, focused = t
     } else {
       // No surfaceId hint — always create new PTY
       window.wmux.pty.create({ shell: effectiveShell, cwd: cwd ?? '', env: {}, startupCommands: startupCommandsRef.current, cols: initialCols, rows: initialRows })
-        .then((created: { id: string; shell: string; startupCommandsConsumed?: boolean; cwdCommand?: string }) => {
+        .then((created: { id: string; shell: string; startupCommandsConsumed?: boolean; cwdCommand?: string; initChannel?: boolean }) => {
           if (disposed) return;
           setResolvedShellForSurface(surfaceId, created.shell);
           attachToPty(created.id);
-          runStartupCommands(created.id, !!created.startupCommandsConsumed, created.cwdCommand);
+          runStartupCommands(created.id, !!created.startupCommandsConsumed, created.cwdCommand, created.initChannel);
         })
         .catch((err: unknown) => terminal.writeln(`\r\n\x1b[31m[failed to create PTY: ${err}]\x1b[0m`));
     }
