@@ -4,15 +4,49 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.RAW_V1_VERBS = void 0;
 exports.timeoutMessage = timeoutMessage;
 exports.browserRequest = browserRequest;
 exports.subcommandError = subcommandError;
+exports.rawV1Error = rawV1Error;
 const net_1 = __importDefault(require("net"));
 const fs_1 = __importDefault(require("fs"));
 const os_1 = __importDefault(require("os"));
 const path_1 = __importDefault(require("path"));
 const child_process_1 = require("child_process");
 const stream_1 = require("stream");
+const wsl_network_1 = require("./wsl-network");
+const transport_deadline_1 = require("./transport-deadline");
+/** The two signals wsl-network.ts uses to decide we are inside a WSL distro. */
+function readWslEnvironment() {
+    let osRelease = null;
+    try {
+        osRelease = fs_1.default.readFileSync('/proc/sys/kernel/osrelease', 'utf-8');
+    }
+    catch {
+        // Not Linux, or a kernel that does not expose it — either way, not WSL.
+    }
+    return {
+        osRelease,
+        hasInteropEnv: !!(process.env.WSL_INTEROP || process.env.WSL_DISTRO_NAME),
+    };
+}
+/**
+ * `wslinfo --networking-mode`, or null if it cannot answer. Absent before WSL
+ * 2.0.5, so a null here is ordinary rather than exceptional; parseNetworkingMode
+ * turns it into `unknown` and the caller refuses to guess from there.
+ */
+function readWslNetworkingMode() {
+    try {
+        const probe = (0, child_process_1.spawnSync)('wslinfo', ['--networking-mode'], { encoding: 'utf-8', timeout: 5000 });
+        if (probe.error || probe.status !== 0)
+            return null;
+        return probe.stdout;
+    }
+    catch {
+        return null;
+    }
+}
 // Respect WMUX_PIPE when set (e.g. by a parent wmux running with WMUX_INSTANCE),
 // so the CLI talks to the same instance that spawned the shell.
 const PIPE_PATH = process.env.WMUX_PIPE || '\\\\.\\pipe\\wmux';
@@ -90,8 +124,17 @@ function connectTransport(onConnect) {
 // Mirrors the selection order above: true when connectTransport() will take the
 // npiperelay branch. That is the only transport whose setup costs anything worth
 // pre-warming — a Unix socket or a native named pipe connects in microseconds.
+/**
+ * This process's transport, as transport-deadline.ts wants it described.
+ *
+ * A function rather than a constant: `remoteTarget` is set while parsing argv,
+ * after module load.
+ */
+function currentTransport() {
+    return { remote: !!remoteTarget, pipePath: PIPE_PATH, env: process.env };
+}
 function usesNpiperelay() {
-    return (!remoteTarget && !PIPE_PATH.startsWith('/') && Boolean(process.env.WSL_DISTRO_NAME || process.env.WSLENV));
+    return (0, transport_deadline_1.usesNpiperelay)(currentTransport());
 }
 // Search common installation locations for npiperelay.exe.
 function findNpiperelay() {
@@ -214,37 +257,14 @@ function sendV1(command) {
     });
 }
 /**
- * How long to wait for a V2 reply before giving up.
- *
- * This deadline has to stay LARGER than whatever budget the main process spends
- * serving the same request. When it is shorter the CLI loses a race it should
- * never have been in: a command that succeeds late is reported as a failure, and
- * the server's own diagnosis ('Could not open browser panel', 'browser_not_open',
- * 'ref_not_found: …') is discarded unread because it arrives after we hung up.
- * Only the browser verbs currently need more than this — see BROWSER_CMDS.
+ * How long to wait for a V2 reply before giving up. Only the browser verbs
+ * currently need more than this — see BROWSER_CMDS. The reasoning behind the
+ * number, and behind the floor that raises it on a slow transport, lives with
+ * it in transport-deadline.ts.
  */
-const DEFAULT_V2_TIMEOUT_MS = 5000;
-/**
- * A floor under every deadline, for transports slower than a local named pipe.
- *
- * The budgets above are all sized for a pipe on the same machine, where a
- * round-trip is sub-millisecond and the whole deadline is the server's own
- * thinking time. Neither transport this file grew for issue #19 is that: TCP to
- * a `wmux bridge` from inside a devcontainer, and npiperelay over WSL interop,
- * both measure ~7s worst case on a corporate-managed host — above the 5s default
- * on their own, before wmux has done anything. Every request from a container
- * therefore reported a timeout for a call that had already succeeded.
- *
- * A floor rather than a replacement, so a browser verb keeps the longer budget
- * it asked for, and a local run keeps master's timings unchanged (floor 0).
- */
-const SLOW_TRANSPORT_FLOOR_MS = 30000;
 /** `base`, raised to the slow-transport floor when the transport is a slow one. */
 function deadline(base) {
-    const override = parseInt(process.env.WMUX_RPC_TIMEOUT_MS || '', 10);
-    if (Number.isFinite(override) && override > 0)
-        return Math.max(base, override);
-    return remoteTarget || usesNpiperelay() ? Math.max(base, SLOW_TRANSPORT_FLOOR_MS) : base;
+    return (0, transport_deadline_1.transportDeadline)(base, currentTransport());
 }
 /**
  * What a stalled request says when it gives up.
@@ -257,7 +277,7 @@ function deadline(base) {
 function timeoutMessage(method, timeoutMs) {
     return `${method} timed out after ${timeoutMs}ms — wmux accepted the request but sent no reply. The command may still have completed.`;
 }
-function sendV2(method, params = {}, timeoutMs = DEFAULT_V2_TIMEOUT_MS) {
+function sendV2(method, params = {}, timeoutMs = transport_deadline_1.DEFAULT_V2_TIMEOUT_MS) {
     // Every command carries the caller's surface (WMUX_SURFACE_ID). Browser
     // commands use it to route each agent to its OWN browser pane, so concurrent
     // agents no longer share and clobber one browser window (issue #62); the
@@ -678,15 +698,30 @@ async function cmdSsh(args) {
 async function cmdBridge(args) {
     const port = parseInt(getFlag(args, '--port') || '', 10) || DEFAULT_BRIDGE_PORT;
     // --wsl binds 0.0.0.0 so a container on the Windows host can reach a bridge
-    // running inside WSL2 (issue #19). WSL2's NAT gives the distro an address the
-    // container resolves as host.docker.internal, but 127.0.0.1 inside the distro
-    // is not it. The pipe token still authenticates every request end to end.
+    // running inside WSL2 (issue #19). Under NAT — WSL2's default — the distro has
+    // its own network namespace, so that address is an eth0 on a private 172.x the
+    // container resolves as host.docker.internal, and 127.0.0.1 inside the distro
+    // is not it. Under mirrored networking the distro shares the Windows host's
+    // interfaces instead and 0.0.0.0 is the LAN, so the mode is read at runtime
+    // rather than assumed; see wsl-network.ts for the full reasoning. The pipe
+    // token authenticates every request end to end either way.
     const wslMode = args.includes('--wsl');
-    const host = getFlag(args, '--host') || (wslMode ? '0.0.0.0' : '127.0.0.1');
-    if (host !== '127.0.0.1' && host !== 'localhost') {
-        console.warn('WARNING: binding beyond localhost exposes the wmux pipe to the network.');
-        console.warn(`Prefer the default 127.0.0.1 + an SSH tunnel: ssh -L ${port}:127.0.0.1:${port} user@host`);
+    const wslEnv = readWslEnvironment();
+    const inWsl2 = (0, wsl_network_1.isWsl2)(wslEnv);
+    const decision = (0, wsl_network_1.chooseBridgeHost)({
+        explicitHost: getFlag(args, '--host'),
+        wslMode,
+        inWsl2,
+        mode: inWsl2 ? (0, wsl_network_1.parseNetworkingMode)(readWslNetworkingMode()) : 'unknown',
+        port,
+    });
+    if (decision.host === null) {
+        console.error(`wmux bridge: ${decision.error}`);
+        process.exit(1);
     }
+    const host = decision.host;
+    for (const line of decision.notices)
+        console.warn(line);
     // ── Warm relay pool ─────────────────────────────────────────────────────────
     // Spawn-per-connection made every request pay the relay's whole startup: a fresh
     // npiperelay.exe launched over WSL interop (AV/EDR scans the binary on each exec
@@ -926,21 +961,45 @@ async function cmdAgentActivity(args) {
         params.done = false;
     await sendV2('agent.activity', params);
 }
-// Generic V1 passthrough (issue #19: devcontainer support). Lets a caller send
-// any raw V1 command line (report_pwd, report_git_branch, report_shell_state,
-// report_startup_command, …) without the CLI growing a near-identical wrapper
-// for each. wmux-bash-integration.sh writes those lines straight to the local
-// pipe when it can reach one; inside a devcontainer it can't, so it calls
-// `wmux raw-v1` instead and gets the CLI's transport — including TCP via
-// --remote / WMUX_REMOTE to a `wmux bridge` (issue #78) — for free. Auth is
-// unchanged: sendV1 still prefixes `auth <token>`.
+/**
+ * V1 passthrough for the shell integration (issue #19: devcontainer support).
+ *
+ * wmux-bash-integration.sh writes its state lines straight to the local pipe
+ * when it can reach one. Inside a devcontainer it can't, so it calls
+ * `wmux raw-v1` instead and gets the CLI's transport — including TCP via
+ * --remote / WMUX_REMOTE to a `wmux bridge` (issue #78) — without the CLI
+ * growing a near-identical wrapper per verb. Auth is unchanged: sendV1 still
+ * prefixes `auth <token>`.
+ *
+ * Restricted to the verbs the integration actually emits. A generic passthrough
+ * would make this a permanent side door into V1: every future V1 command becomes
+ * reachable from a container the day it is added, with no review of whether that
+ * was intended, and the pipe's V1 surface stops being something the V1 handler
+ * alone defines. Nothing is lost by naming them — the set is short, and a real
+ * new caller wants a real CLI command anyway.
+ */
+exports.RAW_V1_VERBS = [
+    'report_pwd',
+    'report_git_branch',
+    'clear_git_branch',
+    'report_shell_state',
+    'ports_kick',
+    'report_startup_command',
+];
+function rawV1Error(verb) {
+    if (!verb)
+        return 'Usage: wmux raw-v1 <command> [surfaceId] [args...]';
+    if (exports.RAW_V1_VERBS.includes(verb))
+        return null;
+    return `raw-v1: ${verb} is not a passthrough command. Accepted: ${exports.RAW_V1_VERBS.join(', ')}`;
+}
 async function cmdRawV1(args) {
-    const line = args.slice(1).join(' ');
-    if (!line) {
-        console.error('Usage: wmux raw-v1 <command> [surfaceId] [args...]');
+    const problem = rawV1Error(args[1]);
+    if (problem) {
+        console.error(problem);
         process.exit(1);
     }
-    console.log(await sendV1(line));
+    console.log(await sendV1(args.slice(1).join(' ')));
 }
 // ─── Declared agent state (issue #128) ───────────────────────────────────────
 // The reporting side of the protocol. An agent running inside a wmux pane can
